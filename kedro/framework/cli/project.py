@@ -1,0 +1,343 @@
+"""A collection of CLI commands for working with Kedro project."""
+
+from __future__ import annotations
+
+import os
+import sys
+import warnings
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+import click
+
+from kedro import KedroDeprecationWarning
+from kedro.framework.cli.utils import (
+    KedroCliError,
+    _check_module_importable,
+    _config_file_callback,
+    _split_load_versions,
+    _split_params,
+    call,
+    env_option,
+    forward_command,
+    split_node_names,
+    split_string,
+    validate_conf_source,
+)
+from kedro.framework.project import settings
+from kedro.framework.session.session import KedroSession
+from kedro.utils import load_obj
+
+if TYPE_CHECKING:
+    from kedro.framework.startup import ProjectMetadata
+
+NO_DEPENDENCY_MESSAGE = """{module} is not installed. Please make sure {module} is in
+requirements.txt and run 'pip install -r requirements.txt'."""
+LINT_CHECK_ONLY_HELP = """Check the files for style guide violations, unsorted /
+unformatted imports, and unblackened Python code without modifying the files."""
+OPEN_ARG_HELP = """Open the documentation in your default browser after building."""
+FROM_INPUTS_HELP = (
+    """A list of dataset names which should be used as a starting point."""
+)
+TO_OUTPUTS_HELP = """A list of dataset names which should be used as an end point."""
+FROM_NODES_HELP = """A list of node names which should be used as a starting point."""
+TO_NODES_HELP = """A list of node names which should be used as an end point."""
+NODE_ARG_HELP = """Run only nodes with specified names."""
+RUNNER_ARG_HELP = """Specify a runner that you want to run the pipeline with.
+Available runners: 'SequentialRunner', 'ParallelRunner' and 'ThreadRunner'."""
+ASYNC_ARG_HELP = """Load and save node inputs and outputs asynchronously
+with threads. If not specified, load and save datasets synchronously."""
+RUNNER_PARAMS_HELP = """Specify extra keyword arguments for the runner.
+Items must be separated by comma, keys - by equals sign, example:
+max_workers=4,is_async=True."""
+TAG_ARG_HELP = """Construct the pipeline using only nodes which have this tag
+attached. Option can be used multiple times, what results in a
+pipeline constructed from nodes having any of those tags."""
+LOAD_VERSION_HELP = """Specify a particular dataset version (timestamp) for loading."""
+CONFIG_FILE_HELP = """Specify a YAML configuration file to load the run
+command arguments from. If command line arguments are provided, they will
+override the loaded ones."""
+PIPELINE_ARG_HELP = """Name of the registered pipeline to run.
+If not set, the '__default__' pipeline is run."""
+PIPELINES_ARG_HELP = """Comma-separated names of registered pipelines to run.
+Example: --pipelines data_engineering,feature_engineering
+If not set, the '__default__' pipeline is run."""
+NAMESPACES_ARG_HELP = """Run only node namespaces with specified names."""
+PARAMS_ARG_HELP = """Specify extra parameters that you want to pass
+to the context initialiser. Items must be separated by comma, keys - by colon or equals sign,
+example: param1=value1,param2=value2. Each parameter is split by the first comma,
+so parameter values are allowed to contain colons, parameter keys are not.
+To pass a nested dictionary as parameter, separate keys by '.', example:
+param_group.param1:value1."""
+INPUT_FILE_HELP = """Name of the requirements file to compile."""
+OUTPUT_FILE_HELP = """Name of the file where compiled requirements should be stored."""
+CONF_SOURCE_HELP = """Path of a directory where project configuration is stored."""
+ONLY_MISSING_OUTPUTS_HELP = """Run only nodes with missing outputs.
+If all outputs of a node exist and are persisted, skip the node execution."""
+
+
+@click.group(name="kedro")
+def project_group() -> None:  # pragma: no cover
+    pass
+
+
+@forward_command(project_group, forward_help=True)
+@env_option
+@click.pass_obj  # this will pass the metadata as first argument
+def ipython(metadata: ProjectMetadata, /, env: str, args: Any, **kwargs: Any) -> None:
+    """Open IPython with project specific variables loaded.\n
+
+    Makes the following variables available in your IPython or Jupyter session:\n
+
+    - `catalog`: catalog instance that contains all defined datasets; this is a shortcut for `context.catalog`.\n
+    - `context`: Kedro project context that provides access to Kedro's library components.\n
+    - `pipelines`: Pipelines defined in your pipeline registry.\n
+    - `session`: Kedro session that orchestrates a pipeline run.\n
+
+    To reload these variables (e.g. if you updated `catalog.yml`) use the `%reload_kedro` line magic,
+    which can also be used to see the error message if any of the variables above are undefined.
+    """
+    _check_module_importable("IPython")
+
+    if env:
+        os.environ["KEDRO_ENV"] = env
+    call(["ipython", "--ext", "kedro.ipython", *list(args)])
+
+
+@project_group.command()
+@click.pass_obj  # this will pass the metadata as first argument
+def package(metadata: ProjectMetadata) -> None:
+    """Package the Kedro project as a Python wheel and export the configuration.\n
+
+    This command builds a `.whl` file for the project and saves it to the `dist/` directory.
+    It also packages the project's configuration (excluding any `local/*.yml` files)
+    into a separate `tar.gz` archive for deployment or sharing.\n
+
+    Both artifacts will appear in the `dist/` folder, unless an older project layout is detected.
+    """
+    # Even if the user decides for the older setup.py on purpose,
+    # pyproject.toml is needed for Kedro metadata
+    if (metadata.project_path / "pyproject.toml").is_file():
+        metadata_dir = metadata.project_path
+        destination_dir = "dist"
+    else:
+        # Assume it's an old Kedro project, packaging metadata was under src
+        # (could be pyproject.toml or setup.py, it's not important)
+        metadata_dir = metadata.source_dir
+        destination_dir = "../dist"
+
+    call(
+        [
+            sys.executable,
+            "-m",
+            "build",
+            "--wheel",
+            "--outdir",
+            destination_dir,
+        ],
+        cwd=str(metadata_dir),
+    )
+
+    directory = (
+        str(Path(settings.CONF_SOURCE).parent)
+        if settings.CONF_SOURCE != "conf"
+        else metadata.project_path
+    )
+    call(
+        [
+            "tar",
+            "--exclude=local/*.yml",
+            "-czf",
+            f"dist/conf-{metadata.package_name}.tar.gz",
+            f"--directory={directory}",
+            str(Path(settings.CONF_SOURCE).stem),
+        ]
+    )
+
+
+@project_group.command()
+@click.option(
+    "--from-inputs",
+    type=str,
+    default="",
+    help=FROM_INPUTS_HELP,
+    callback=split_string,
+)
+@click.option(
+    "--to-outputs",
+    type=str,
+    default="",
+    help=TO_OUTPUTS_HELP,
+    callback=split_string,
+)
+@click.option(
+    "--from-nodes",
+    type=str,
+    default="",
+    help=FROM_NODES_HELP,
+    callback=split_node_names,
+)
+@click.option(
+    "--to-nodes", type=str, default="", help=TO_NODES_HELP, callback=split_node_names
+)
+@click.option(
+    "--nodes",
+    "-n",
+    "node_names",
+    type=str,
+    default="",
+    help=NODE_ARG_HELP,
+    callback=split_node_names,
+)
+@click.option("--runner", "-r", type=str, default=None, help=RUNNER_ARG_HELP)
+@click.option("--async", "is_async", is_flag=True, help=ASYNC_ARG_HELP)
+@click.option(
+    "--runner-params",
+    type=click.UNPROCESSED,
+    default="",
+    help=RUNNER_PARAMS_HELP,
+    callback=_split_params,
+)
+@env_option
+@click.option(
+    "--tags",
+    "-t",
+    type=str,
+    default="",
+    help=TAG_ARG_HELP,
+    callback=split_string,
+)
+@click.option(
+    "--load-versions",
+    "-lv",
+    type=str,
+    default="",
+    help=LOAD_VERSION_HELP,
+    callback=_split_load_versions,
+)
+@click.option("--pipeline", "-p", type=str, default=None, help=PIPELINE_ARG_HELP)
+@click.option(
+    "--pipelines", type=str, default="", help=PIPELINES_ARG_HELP, callback=split_string
+)
+@click.option(
+    "--namespaces",
+    "-ns",
+    type=str,
+    default="",
+    help=NAMESPACES_ARG_HELP,
+    callback=split_node_names,
+)
+@click.option(
+    "--config",
+    "-c",
+    type=click.Path(exists=True, dir_okay=False, resolve_path=True),
+    help=CONFIG_FILE_HELP,
+    callback=_config_file_callback,
+)
+@click.option(
+    "--conf-source",
+    callback=validate_conf_source,
+    help=CONF_SOURCE_HELP,
+)
+@click.option(
+    "--params",
+    type=click.UNPROCESSED,
+    default="",
+    help=PARAMS_ARG_HELP,
+    callback=_split_params,
+)
+@click.option(
+    "--only-missing-outputs",
+    is_flag=True,
+    help=ONLY_MISSING_OUTPUTS_HELP,
+)
+def run(  # noqa: PLR0913
+    tags: str,
+    env: str,
+    runner: str,
+    is_async: bool,
+    runner_params: dict[str, Any],
+    node_names: str,
+    to_nodes: str,
+    from_nodes: str,
+    from_inputs: str,
+    to_outputs: str,
+    load_versions: dict[str, str] | None,
+    pipeline: str,
+    pipelines: list[str],
+    config: str,
+    conf_source: str,
+    params: dict[str, Any],
+    namespaces: str,
+    only_missing_outputs: bool,
+) -> dict[str, Any]:
+    """Run the pipeline."""
+
+    if pipeline and pipelines:
+        raise KedroCliError(
+            "Options '--pipeline' and '--pipelines' cannot be used together"
+        )
+    if pipeline:
+        warnings.warn(
+            "Option '--pipeline' is deprecated and will be removed in a future release. "
+            "Please use '--pipelines' instead.",
+            KedroDeprecationWarning,
+        )
+        pipelines_to_run = [pipeline]
+
+    else:
+        pipelines_to_run = list(set(pipelines)) if pipelines else []
+
+    runner_obj = load_obj(runner or "SequentialRunner", "kedro.runner")
+    runner_kwargs = _resolve_runner_kwargs(is_async, runner_params)
+    tuple_tags = tuple(tags)
+    tuple_node_names = tuple(node_names)
+    create_kwargs: dict[str, Any] = {"env": env, "conf_source": conf_source}
+    run_kwargs: dict[str, Any] = {
+        "tags": tuple_tags,
+        "runner": runner_obj(**runner_kwargs),
+        "node_names": tuple_node_names,
+        "from_nodes": from_nodes,
+        "to_nodes": to_nodes,
+        "from_inputs": from_inputs,
+        "to_outputs": to_outputs,
+        "load_versions": load_versions,
+        "pipeline_names": pipelines_to_run,
+        "namespaces": namespaces,
+        "only_missing_outputs": only_missing_outputs,
+    }
+    # This conditioning is needed because KedroSession accepts runtime_params in create() method,
+    # while KedroServiceSession accepts them in run() method. This is temporary solution until
+    # KedroSession is removed in favor of KedroServiceSession.
+    if issubclass(settings.SESSION_CLASS, KedroSession):
+        create_kwargs["runtime_params"] = params
+    else:
+        run_kwargs["runtime_params"] = params
+
+    with settings.SESSION_CLASS.create(**create_kwargs) as session:
+        result: dict[str, Any] = session.run(**run_kwargs)
+    return result
+
+
+def _resolve_runner_kwargs(
+    is_async: bool, runner_params: dict[str, Any]
+) -> dict[str, Any]:
+    """Merge runner params with the legacy --async flag."""
+    runner_kwargs = dict(runner_params)
+
+    if is_async:
+        warnings.warn(
+            "Option '--async' is deprecated and will be removed in Kedro 2.0. "
+            "Please use '--runner-params=is_async=True' instead.",
+            KedroDeprecationWarning,
+        )
+        if "is_async" in runner_kwargs and not runner_kwargs["is_async"]:
+            raise KedroCliError(
+                "Options '--async' and '--runner-params=is_async=False' "
+                "cannot be used together."
+            )
+        runner_kwargs["is_async"] = True
+    else:
+        runner_kwargs.setdefault("is_async", False)
+
+    return runner_kwargs

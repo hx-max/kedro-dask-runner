@@ -1,0 +1,421 @@
+"""This module provides context for Kedro project."""
+
+from __future__ import annotations
+
+import logging
+from copy import deepcopy
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
+from warnings import warn
+
+from attrs import define, field
+
+from kedro.config import AbstractConfigLoader, MissingConfigException
+from kedro.framework.context import CatalogCommandsMixin
+from kedro.io import CatalogProtocol, DataCatalog
+from kedro.pipeline.transcoding import _transcode_split
+from kedro.validation.utils import get_typed_fields
+
+if TYPE_CHECKING:
+    from pluggy import PluginManager
+
+
+def _is_relative_path(path_string: str) -> bool:
+    """Checks whether a path string is a relative path.
+
+    Example:
+    ``` python
+    _is_relative_path("data/01_raw") == True
+    _is_relative_path("info.log") == True
+    _is_relative_path("/tmp/data/01_raw") == False
+    _is_relative_path(r"C:\\info.log") == False
+    _is_relative_path(r"\\'info.log") == False
+    _is_relative_path("c:/info.log") == False
+    _is_relative_path("s3://info.log") == False
+
+    Args:
+        path_string: The path string to check.
+    Returns:
+        Whether the string is a relative path.
+    ```
+    """
+    # os.path.splitdrive does not reliably work on non-Windows systems
+    # breaking the coverage, using PureWindowsPath instead
+    is_full_windows_path_with_drive = bool(PureWindowsPath(path_string).drive)
+    if is_full_windows_path_with_drive:
+        return False
+
+    is_remote_path = bool(urlparse(path_string).scheme)
+    if is_remote_path:
+        return False
+
+    is_absolute_path = PurePosixPath(path_string).is_absolute()
+    if is_absolute_path:
+        return False
+
+    return True
+
+
+def _convert_paths_to_absolute_posix(
+    project_path: Path, conf_dictionary: dict[str, Any]
+) -> dict[str, Any]:
+    """Turn all relative paths inside ``conf_dictionary`` into absolute paths by appending them
+    to ``project_path`` and convert absolute Windows paths to POSIX format. This is a hack to
+    make sure that we don't have to change user's working directory for logging and datasets to
+    work. It is important for non-standard workflows such as IPython notebook where users don't go
+    through `kedro run` or `__main__.py` entrypoints.
+
+    Example:
+    ```` python
+    conf = _convert_paths_to_absolute_posix(
+        project_path=Path("/path/to/my/project"),
+        conf_dictionary={
+            "handlers": {
+                "info_file_handler": {
+                    "filename": "info.log"
+                }
+            }
+        }
+    )
+    print(conf['handlers']['info_file_handler']['filename'])
+    "/path/to/my/project/info.log"
+
+    Args:
+        project_path: The root directory to prepend to relative path to make absolute path.
+        conf_dictionary: The configuration containing paths to expand.
+    Returns:
+        A dictionary containing only absolute paths.
+    Raises:
+        ValueError: If the provided ``project_path`` is not an absolute path.
+    ```
+    """
+    if not project_path.is_absolute():
+        raise ValueError(
+            f"project_path must be an absolute path. Received: {project_path}"
+        )
+
+    # only check a few conf keys that are known to specify a path string as value
+    conf_keys_with_filepath = ("filename", "filepath", "path")
+
+    for conf_key, conf_value in conf_dictionary.items():
+        # if the conf_value is another dictionary, absolutify its paths first.
+        if isinstance(conf_value, dict):
+            conf_dictionary[conf_key] = _convert_paths_to_absolute_posix(
+                project_path, conf_value
+            )
+            continue
+
+        # if the conf_value is not a dictionary nor a string, skip
+        if not isinstance(conf_value, str):
+            continue
+
+        # if the conf_value is a string but the conf_key isn't one associated with filepath, skip
+        if conf_key not in conf_keys_with_filepath:
+            continue
+
+        if _is_relative_path(conf_value):
+            # Absolute local path should be in POSIX format
+            conf_value_absolute_path = (project_path / conf_value).as_posix()
+            conf_dictionary[conf_key] = conf_value_absolute_path
+        elif PureWindowsPath(conf_value).drive:
+            # Convert absolute Windows path to POSIX format
+            conf_dictionary[conf_key] = PureWindowsPath(conf_value).as_posix()
+
+    return conf_dictionary
+
+
+def _validate_transcoded_datasets(catalog: CatalogProtocol) -> None:
+    """Validates transcoded datasets are correctly named
+
+    Args:
+        catalog: The catalog object containing the datasets to be
+            validated.
+
+    Raises:
+        ValueError: If a dataset name does not conform to the expected
+            transcoding naming conventions,a ValueError is raised by the
+            `_transcode_split` function.
+
+    """
+    for dataset_name in catalog:
+        _transcode_split(dataset_name)
+
+
+def _expand_full_path(project_path: str | Path) -> Path:
+    return Path(project_path).expanduser().resolve()
+
+
+@define(slots=False)  # Enable setting new attributes to `KedroContext`
+class KedroContext:
+    """``KedroContext`` is the base class which holds the configuration and
+    Kedro's main functionality.
+
+    Create a context object by providing the root of a Kedro project and
+    the environment configuration subfolders (see ``kedro.config.OmegaConfigLoader``)
+    Raises:
+        KedroContextError: If there is a mismatch
+            between Kedro project version and package version.
+    Args:
+        project_path: Project path to define the context for.
+        config_loader: Kedro's ``OmegaConfigLoader`` for loading the configuration files.
+        env: Optional argument for configuration default environment to be used
+            for running the pipeline. If not specified, it defaults to "local".
+        package_name: Package name for the Kedro project the context is
+            created for.
+        hook_manager: The ``PluginManager`` to activate hooks, supplied by the session.
+        runtime_params: Optional dictionary containing runtime project parameters.
+            If specified, will update (and therefore take precedence over)
+            the parameters retrieved from the project configuration.
+
+    """
+
+    project_path: Path = field(init=True, converter=_expand_full_path)
+    config_loader: AbstractConfigLoader = field(init=True)
+    env: str | None = field(init=True)
+    _package_name: str = field(init=True)
+    _hook_manager: PluginManager = field(init=True)
+    _runtime_params: dict[str, Any] | None = field(
+        init=True, default=None, converter=deepcopy
+    )
+    # Pipelines to scope parameter validation to. Set by the session before
+    # building the catalog; `None` means "all registered pipelines".
+    _pipelines_to_validate: list[str] | None = None
+    _validated_params_cache: dict[str, Any] | None = None
+    # Scope under which `_validated_params_cache` was filled. Lets the cache
+    # be transparently invalidated if `_pipelines_to_validate` changes between
+    # an unscoped read (e.g. an `after_context_created` hook reading `params`)
+    # and a scoped read from the session.
+    _cached_validation_scope: list[str] | None = None
+
+    @property
+    def catalog(self) -> CatalogProtocol:
+        """Read-only property referring to Kedro's catalog` for this context.
+
+        Returns:
+            catalog defined in `catalog.yml`.
+        Raises:
+            KedroContextError: Incorrect catalog registered for the project.
+
+        """
+        return self._get_catalog()
+
+    def _get_validated_params(self) -> dict[str, Any]:
+        """Get validated parameters with caching support.
+
+        Scope is taken from `self._pipelines_to_validate`; when unset,
+        all registered pipelines are inspected.
+
+        Returns:
+            Validated and transformed parameters with model instantiation.
+        """
+        if (
+            self._validated_params_cache is not None
+            and self._cached_validation_scope == self._pipelines_to_validate
+        ):
+            return self._validated_params_cache
+
+        try:
+            raw_params = self.config_loader["parameters"]
+        except MissingConfigException as exc:
+            warn(f"Parameters not found in your Kedro project config.\n{exc!s}")
+            raw_params = self._runtime_params or {}
+
+        try:
+            from kedro.framework.project import pipelines as project_pipelines
+            from kedro.validation.parameter_validator import ParameterValidator
+
+            if self._pipelines_to_validate is None:
+                pipelines_to_validate = dict(project_pipelines)
+            else:
+                pipelines_to_validate = {
+                    name: project_pipelines[name]
+                    for name in self._pipelines_to_validate
+                }
+
+            validator = ParameterValidator(pipelines_to_validate)
+            validated_params = validator.validate_raw_params(raw_params)
+        except ImportError:
+            logging.getLogger(__name__).warning(
+                "Could not import pipelines, skipping parameter validation"
+            )
+            validated_params = raw_params
+
+        self._validated_params_cache = validated_params
+        self._cached_validation_scope = self._pipelines_to_validate
+
+        return validated_params
+
+    @property
+    def params(self) -> dict[str, Any]:
+        """Read-only property referring to Kedro's parameters for this context.
+
+        Validation is scoped only when the session sets
+        `_pipelines_to_validate` before building the catalog; reading
+        `params` in isolation (hooks, notebooks) validates every pipeline.
+
+        Returns:
+            Parameters defined in `parameters.yml` with the addition of any
+                extra parameters passed at initialization. Parameters are validated
+                and transformed according to pipeline node type hints.
+        """
+        return self._get_validated_params()
+
+    def _get_catalog(
+        self,
+        catalog_class: type = DataCatalog,
+        save_version: str | None = None,
+        load_versions: dict[str, str] | None = None,
+    ) -> CatalogProtocol:
+        """A hook for changing the creation of a catalog instance.
+
+        Returns:
+            catalog defined in `catalog.yml`.
+        Raises:
+            KedroContextError: Incorrect catalog registered for the project.
+
+        """
+        # '**/catalog*' reads modular pipeline configs
+        conf_catalog = self.config_loader["catalog"]
+        # turn relative paths in conf_catalog into absolute paths
+        # before initializing the catalog
+        conf_catalog = _convert_paths_to_absolute_posix(
+            project_path=self.project_path, conf_dictionary=conf_catalog
+        )
+        conf_creds = self._get_config_credentials()
+
+        if catalog_class is DataCatalog:
+            catalog_class = compose_classes(catalog_class, CatalogCommandsMixin)
+
+        catalog: CatalogProtocol = catalog_class.from_config(  # type: ignore[attr-defined]
+            catalog=conf_catalog,
+            credentials=conf_creds,
+            load_versions=load_versions,
+            save_version=save_version,
+        )
+
+        parameters = self._get_parameters()
+
+        # Add parameters data to catalog.
+        for param_name, param_value in parameters.items():
+            catalog[param_name] = param_value
+
+        self._configure_dataset_validation(catalog, conf_catalog)
+
+        _validate_transcoded_datasets(catalog)
+
+        self._hook_manager.hook.after_catalog_created(
+            catalog=catalog,
+            conf_catalog=conf_catalog,
+            conf_creds=conf_creds,
+            parameters=parameters,
+            save_version=save_version,
+            load_versions=load_versions,
+        )
+        return catalog
+
+    def _get_parameters(self) -> dict[str, Any]:
+        """Returns a dictionary with data to be added in memory as ``MemoryDataset`` instances.
+        Keys represent parameter names and the values are parameter values."""
+        params = self.params
+        params_dict: dict[str, Any] = {"parameters": params}
+
+        def _add_param_to_params_dict(param_name: str, param_value: Any) -> None:
+            """This recursively adds parameter paths that are defined in `parameters.yml`
+            with the addition of any extra parameters passed at initialization to the `params_dict`,
+            whenever `param_value` is a dictionary itself, so that users can
+            specify specific nested parameters in their node inputs.
+
+            Example:
+            ``` python
+            param_name = "a"
+            param_value = {"b": 1}
+            _add_param_to_params_dict(param_name, param_value)
+            assert params_dict["params:a"] == {"b": 1}
+            assert params_dict["params:a.b"] == 1
+            ```
+            """
+            key = f"params:{param_name}"
+            params_dict[key] = param_value
+
+            param_fields: dict[str, Any] | None = None
+            if isinstance(param_value, dict):
+                param_fields = param_value
+            else:
+                param_fields = get_typed_fields(param_value)
+
+            if param_fields is not None:
+                for field_name, field_value in param_fields.items():
+                    _add_param_to_params_dict(f"{param_name}.{field_name}", field_value)
+
+        for param_name, param_value in params.items():
+            _add_param_to_params_dict(param_name, param_value)
+
+        return params_dict
+
+    def _get_config_credentials(self) -> dict[str, Any]:
+        """Getter for credentials specified in credentials directory."""
+        try:
+            conf_creds: dict[str, Any] = self.config_loader["credentials"]
+        except MissingConfigException as exc:
+            logging.getLogger(__name__).debug(
+                "Credentials not found in your Kedro project config.\n %s", str(exc)
+            )
+            conf_creds = {}
+        return conf_creds
+
+    def _configure_dataset_validation(
+        self, catalog: CatalogProtocol, conf_catalog: dict[str, Any]
+    ) -> None:
+        """Propagate the `DATASET_VALIDATION` project setting to the catalog.
+
+        If the catalog class implements the validation funnel (exposes a
+        `validation_enabled` attribute), the setting is applied to it.
+        Otherwise, a warning is emitted when datasets declare validators
+        that this catalog class will ignore.
+
+        Args:
+            catalog: The catalog to configure dataset validation for.
+            conf_catalog: The raw catalog configuration, used to detect
+                declared `validator` keys on datasets.
+        """
+        from kedro.framework.project import settings
+
+        enabled = bool(getattr(settings, "DATASET_VALIDATION", True))
+
+        if hasattr(catalog, "validation_enabled"):
+            catalog.validation_enabled = enabled
+            specs = getattr(catalog, "validator_specs", None)
+            if enabled and specs:
+                from kedro.validation import preflight_check
+
+                for warning in preflight_check(specs):
+                    logging.getLogger(__name__).warning(warning)
+        elif enabled:
+            from kedro.io.core import VALIDATOR_KEY
+
+            declared = sorted(
+                ds_name
+                for ds_name, ds_config in conf_catalog.items()
+                if isinstance(ds_config, dict) and VALIDATOR_KEY in ds_config
+            )
+            if declared:
+                logging.getLogger(__name__).warning(
+                    "Datasets %s declare a '%s' key, but catalog class '%s' "
+                    "does not support dataset validation. Declared validators "
+                    "will be ignored.",
+                    declared,
+                    VALIDATOR_KEY,
+                    type(catalog).__name__,
+                )
+
+
+class KedroContextError(Exception):
+    """Error occurred when loading project and running context pipeline."""
+
+
+def compose_classes(base: type, *mixins: type) -> type:
+    """Injecting mixins dynamically"""
+    t = (base, *mixins)
+    name = f"{base.__name__}With{''.join(x.__name__ for x in mixins)}"
+    return type(name, t, {})

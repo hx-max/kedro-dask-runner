@@ -1,0 +1,202 @@
+# Introduction to Hooks
+
+## Concepts
+
+A Hook consists of a Hook specification, and Hook implementation.
+
+## Hook specifications
+
+Kedro defines Hook specifications for particular execution points where users can inject additional behaviour. [kedro.framework.hooks][] provides the following Hook specifications:
+
+- `after_context_created`
+- `after_catalog_created`
+- `before_pipeline_run`
+- `before_dataset_loaded`
+- `after_dataset_loaded`
+- `before_node_run`
+- `after_node_run`
+- `before_dataset_saved`
+- `after_dataset_saved`
+- `after_pipeline_run`
+- `on_node_error`
+- `on_pipeline_error`
+
+The naming convention for non-error Hooks is `<before/after>_<noun>_<past_participle>`, in which:
+
+- `<before/after>` and `<past_participle>` refers to when the Hook executed, for example, `before <something> was run` or `after <something> was created`.
+- `<noun>` refers to the relevant component in the Kedro execution timeline for which this Hook adds extra behaviour, for example, `catalog`, `node` and `pipeline`.
+
+The naming convention for error hooks is `on_<noun>_error`, in which:
+
+- `<noun>` refers to the relevant component in the Kedro execution timeline that throws the error.
+
+The full specifications for which you can inject additional behaviours by providing an implementation are listed in [kedro.framework.hooks][]. The full per-argument signature of each hook is documented in the [`kedro.framework.hooks.specs` API reference](../../api/framework/kedro.framework.hooks.md#kedro.framework.hooks.specs).
+
+This diagram illustrates the execution order of hooks during `kedro run`:
+![Kedro run hook execution order](../../meta/images/kedro_run_lifecycle.png)
+
+!!! warning
+
+    Some hooks will not execute when using `ParallelRunner`. Specifically, `catalog`, `context`, and `pipeline` hooks that run in the main process will execute, but `dataset` and `node` hooks do not run in the worker processes that run nodes in parallel. Use `SequentialRunner` or `ThreadRunner` if your project relies on these hooks.
+
+### Available arguments per hook
+
+The table below summarises which arguments each Hook specification exposes. You can declare a subset of these in your implementation. Thanks to [the opt-in argument behaviour in pluggy](https://pluggy.readthedocs.io/en/stable/#opt-in-arguments), unused arguments may be omitted from the signature. Kedro passes the exact arguments you declare. Refer to the [API reference for `kedro.framework.hooks.specs`](../../api/framework/kedro.framework.hooks.md#kedro.framework.hooks.specs) for a detailed description of each argument.
+
+| Hook                    | Available arguments                                                                    |
+| ----------------------- | -------------------------------------------------------------------------------------- |
+| `after_context_created` | `context`                                                                              |
+| `after_catalog_created` | `catalog`, `conf_catalog`, `conf_creds`, `parameters`, `save_version`, `load_versions` |
+| `before_pipeline_run`   | `run_params`, `pipeline`, `catalog`                                                    |
+| `after_pipeline_run`    | `run_params`, `run_result`, `pipeline`, `catalog`                                      |
+| `on_pipeline_error`     | `error`, `run_params`, `pipeline`, `catalog`                                           |
+| `before_node_run`       | `node`, `catalog`, `inputs`, `is_async`, `run_id`                                      |
+| `after_node_run`        | `node`, `catalog`, `inputs`, `outputs`, `is_async`, `run_id`                           |
+| `on_node_error`         | `error`, `node`, `catalog`, `inputs`, `is_async`, `run_id`                             |
+| `before_dataset_loaded` | `dataset_name`, `node`                                                                 |
+| `after_dataset_loaded`  | `dataset_name`, `data`, `node`                                                         |
+| `before_dataset_saved`  | `dataset_name`, `data`, `node`                                                         |
+| `after_dataset_saved`   | `dataset_name`, `data`, `node`                                                         |
+
+The `run_params` argument carries the same dictionary in `before_pipeline_run`, `after_pipeline_run`, and `on_pipeline_error`. Its schema is documented inline on each spec, for example, [`before_pipeline_run`](../../api/framework/kedro.framework.hooks.md#kedro.framework.hooks.specs.PipelineSpecs.before_pipeline_run).
+
+### CLI Hooks
+
+Kedro defines a small set of CLI hooks that inject additional behaviour around execution of a Kedro CLI command:
+
+- `before_command_run`
+- `after_command_run`
+
+This is what the [`kedro-telemetry` plugin](https://github.com/kedro-org/kedro-plugins/tree/main/kedro-telemetry) relies on to collect CLI usage statistics.
+
+## Hook implementation
+
+To add Hooks to your Kedro project, you must:
+
+- Create or update the file `src/<package_name>/hooks.py` to define a Hook implementation for the particular Hook specification that describes the point at which you want to inject additional behaviour
+- Register that Hook implementation in the [`src/<package_name>/settings.py`](../../tutorials/settings.md) file under the `HOOKS` key
+
+### Define the Hook implementation
+
+The Hook implementation should have the same name as the specification. The Hook must provide a concrete implementation with a subset of the corresponding specification's parameters (you do not need to use them all).
+
+To declare a Hook implementation, use the `@hook_impl` decorator.
+
+For example, the full signature of the [after_catalog_created][kedro.framework.hooks.specs.DataCatalogSpecs.after_catalog_created] Hook specification is:
+
+```python
+@hook_spec
+def after_catalog_created(
+    self,
+    catalog: DataCatalog,
+    conf_catalog: Dict[str, Any],
+    conf_creds: Dict[str, Any],
+    save_version: str,
+    load_versions: Dict[str, str],
+) -> None:
+    pass
+```
+
+If you want to use this Hook to list the contents of a data catalog after it is created, your Hook implementation can look like:
+
+```python
+# src/<package_name>/hooks.py
+import logging
+
+from kedro.framework.hooks import hook_impl
+from kedro.io import DataCatalog
+
+
+class DataCatalogHooks:
+    @property
+    def _logger(self):
+        return logging.getLogger(__name__)
+
+    @hook_impl
+    def after_catalog_created(self, catalog: DataCatalog) -> None:
+        self._logger.info(catalog.list())
+```
+
+!!! note
+
+    The name of a module that contains Hooks implementation is arbitrary and is not restricted to `hooks.py`.
+
+We recommend that you group related Hook implementations under a namespace, preferably a class, within a `hooks.py` file that you create in your project.
+
+!!! Warning
+
+    Do not use default argument values in hook implementations
+
+Hook parameters must be defined **without default values**. Due to how [pluggy](https://pluggy.readthedocs.io/en/stable/) (the underlying plugin system) passes arguments, parameters with defaults will receive the default value instead of the actual value passed by Kedro.
+
+```python
+# Wrong: run_params will always be an empty dict
+@hook_impl
+def before_pipeline_run(self, run_params: Dict[str, Any] = {}):
+    print(run_params)  # Prints: {}
+
+# Correct: run_params receives the actual value
+@hook_impl
+def before_pipeline_run(self, run_params: Dict[str, Any]):
+    print(run_params)  # Prints the actual run parameters
+```
+
+### Registering the Hook implementation with Kedro
+
+Hook implementations should be registered with Kedro using the [`src/<package_name>/settings.py`](../../tutorials/settings.md) file under the `HOOKS` key.
+
+You can register more than one implementation for the same specification. They will be called in LIFO (last-in, first-out) order.
+
+The following example sets up a Hook so that the `after_data_catalog_created` implementation is called, every time, after a data catalog is created.
+
+```python
+# src/<package_name>/settings.py
+from <package_name>.hooks import ProjectHooks, DataCatalogHooks
+
+HOOKS = (ProjectHooks(), DataCatalogHooks())
+```
+
+Kedro also has auto-discovery enabled by default. This means that any installed plugins that declare a Hooks entry-point will be registered. To learn more about how to enable this for your custom plugin, see our [plugin development guide](../plugins.md#hooks).
+
+!!! note
+
+    Auto-discovered Hooks will run *first*, followed by the ones specified in `settings.py`.
+
+#### Auto-registered Hook with plugin
+
+You can auto-register a Hook (pip-installable) by creating a [Kedro plugin](https://docs.kedro.org/en/stable/extend/plugins/#hooks). Kedro provides `kedro.hooks` entrypoints to make this extension straightforward.
+
+#### Disable auto-registered plugins' Hooks
+
+Auto-registered plugins' Hooks can be disabled by using `settings.py` as follows:
+
+```python
+# src/<package_name>/settings.py
+
+DISABLE_HOOKS_FOR_PLUGINS = ("<plugin_name>",)
+```
+
+where `<plugin_name>` is the name of an installed plugin for which the auto-registered Hooks must be disabled.
+
+## Hook execution order
+
+Hooks follow a Last-In-First-Out (LIFO) order, which means the first registered Hook will be executed last.
+
+Hooks are registered in the following order:
+
+1. Project Hooks in `settings.py` - If you have `HOOKS = (hook_a, hook_b,)`, `hook_b` will be executed before `hook_a`
+2. Plugin Hooks registered in `kedro.hooks`, which follows alphabetical order
+
+In general, Hook execution order is not guaranteed and you should not rely on it. If you need to make sure a particular Hook is executed first or last, you can use the [`tryfirst` or `trylast` argument](https://pluggy.readthedocs.io/en/stable/index.html#call-time-order) for `hook_impl`.
+
+## Under the hood
+
+Under the hood, we use the [pytest plugin system](https://pluggy.readthedocs.io/en/latest/) to power Kedro's Hook mechanism. We recommend reading their documentation to find out more about the underlying implementation.
+
+```{note}
+When your project's logging level is set to `DEBUG`, the hooks will use `pluggy`'s tracing feature to log the execution of each hook. This is useful for debugging purposes but can be noisy and slow down the execution of your pipeline. You can disable this feature by [setting the logging level to `INFO` or higher](../logging/index.md#how-to-show-debug-level-messages).
+```
+
+### Plugin Hooks
+
+Plugin Hooks are registered using [`importlib_metadata`'s `EntryPoints` API](https://docs.python.org/3/library/importlib.metadata.html).

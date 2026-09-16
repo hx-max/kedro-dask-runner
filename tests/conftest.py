@@ -1,0 +1,74 @@
+"""
+This file contains the fixtures that are reusable by any tests within
+this directory. You don't need to import the fixtures as pytest will
+discover them automatically. More info here:
+https://docs.pytest.org/en/latest/fixture.html
+"""
+
+import multiprocessing
+import os
+import sys
+
+import pandas as pd
+import pytest
+
+from kedro.io.core import AbstractDataset
+
+# Python 3.14 changed the default multiprocessing start method on Linux from
+# "fork" to "forkserver". The "forkserver" method is incompatible with
+# pytest-cov because coverage's sitecustomize injection fails in the forkserver
+# subprocess (os.path.realpath('.') raises FileNotFoundError). Use "spawn"
+# instead, which coverage handles correctly and which matches the behaviour
+# already tested on Windows/macOS.
+if sys.version_info >= (3, 14) and multiprocessing.get_start_method() == "forkserver":
+    multiprocessing.set_start_method("spawn", force=True)
+
+
+@pytest.fixture(autouse=True)
+def preserve_system_context():
+    """
+    Revert some changes to the application context tests do to isolate them.
+    """
+    old_path = sys.path.copy()
+    old_cwd = os.getcwd()
+    yield
+    sys.path = old_path
+
+    if os.getcwd() != old_cwd:
+        os.chdir(old_cwd)  # pragma: no cover
+
+
+@pytest.fixture
+def dummy_dataframe():
+    """Return a dummy pandas DataFrame for testing."""
+    return pd.DataFrame({"col1": [1, 2], "col2": [4, 5], "col3": [5, 6]})
+
+
+@pytest.fixture
+def dummy_dataframe_simple():
+    """Return a simple dummy pandas DataFrame for testing."""
+    return pd.DataFrame({"test": [1, 2]})
+
+
+class PersistentTestDataset(AbstractDataset):
+    def __init__(self, load=None, save=None, exists=None):
+        self._load_fn = load or (lambda: None)
+        self._save_fn = save or (lambda data: None)
+        self._exists_fn = exists
+        if exists is not None:
+            # Dynamically add _exists only if exists is provided
+            self._exists = lambda: self._exists_fn()
+
+    def _load(self):
+        return self._load_fn()
+
+    def _save(self, data):
+        self._save_fn(data)
+
+    def _describe(self) -> dict:
+        return {}
+
+
+@pytest.fixture
+def persistent_test_dataset():
+    return PersistentTestDataset

@@ -1,0 +1,51 @@
+cff-version: 1.2.0
+message: If you use this software, please cite it as below.
+authors:
+- family-names: Alam
+  given-names: Sajid
+- family-names: Brugman
+  given-names: Simon
+- family-names: Chan
+  given-names: Nok Lam
+- family-names: Cima
+  given-names: Alice
+- family-names: Couto
+  given-names: Laura
+- family-names: Dada
+  given-names: Yetunde
+  orcid: https://orcid.org/0000-0002-5273-954X
+- family-names: Danov
+  given-names: Ivan
+- family-names: Datta
+  given-names: Deepyaman
+  orcid: https://orcid.org/0009-0006-7814-1446
+- family-names: DeBold
+  given-names: Tynan
+- family-names: Gundaniya
+  given-names: Jitendra
+- family-names: Honoré-Rougé
+  given-names: Yolan
+- family-names: Kanchwala
+  given-names: Rashida
+- family-names: Katiyar
+  given-names: Ankita
+- family-names: Khaustova
+  given-names: Elena
+- family-names: Ko
+  given-names: Elijah
+- family-names: Nguyen
+  given-names: Huong
+- family-names: Perkins
+  given-names: Joseph
+- family-names: Pilla
+  given-names: Ravi Kumar
+- family-names: Schwarzmann
+  given-names: Joel
+- family-names: Theisen
+  given-names: Merel
+- family-names: Zabłocki
+  given-names: Marcin
+title: Kedro
+version: 1.6.0
+date-released: 2026-09-03
+url: https://github.com/kedro-org/kedro

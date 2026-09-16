@@ -1,0 +1,226 @@
+# Inspect a Kedro project
+
+The inspection API lets you read the structure of a Kedro project without running it. It returns a [ProjectSnapshot][kedro.inspection.models.ProjectSnapshot] that captures:
+
+- Project metadata (name, package, Kedro version)
+- All registered pipelines and their nodes in topological order
+- Catalog dataset configurations
+- Parameter key names (not values)
+
+## When to use the inspection API
+
+Use `get_project_snapshot` when you need to read the structure of a Kedro project from Python code without running any nodes or loading any data. Common use cases include:
+
+- **CI validation**: assert that expected pipelines, datasets, or parameters are present before a run
+- **Tooling**: generate documentation, diagrams, or reports from project structure
+- **IDE integrations**: surface pipeline metadata to developers without executing code
+- **Programmatic access**: query project structure in scripts or notebooks
+
+!!! note
+
+    The inspection API reads configuration and pipeline definitions. It does not load datasets, execute nodes, or write data.
+
+The following sections explain how to use the inspection API:
+
+- [How to get a project snapshot](#how-to-get-a-project-snapshot)
+- [How to access project metadata](#how-to-access-project-metadata)
+- [How to explore pipeline structure](#how-to-explore-pipeline-structure)
+- [How to inspect catalog datasets](#how-to-inspect-catalog-datasets)
+- [How to list parameter keys](#how-to-list-parameter-keys)
+- [How to inspect a specific environment](#how-to-inspect-a-specific-environment)
+- [How to pass runtime parameters](#how-to-pass-runtime-parameters)
+- [How to access the snapshot through the HTTP server](#how-to-access-the-snapshot-through-the-http-server)
+
+## How to get a project snapshot
+
+Call [get_project_snapshot][kedro.inspection.get_project_snapshot] with the path to your project root — the directory that contains `pyproject.toml`:
+
+```python
+from kedro.inspection import get_project_snapshot
+
+snapshot = get_project_snapshot("/path/to/my_project")
+```
+
+You can also pass a `Path` object or a relative path:
+
+```python
+from pathlib import Path
+from kedro.inspection import get_project_snapshot
+
+snapshot = get_project_snapshot(Path.cwd())
+```
+
+The returned [ProjectSnapshot][kedro.inspection.models.ProjectSnapshot] is a data class with four attributes: `metadata`, `pipelines`, `datasets`, and `parameters`.
+
+## How to access project metadata
+
+The `metadata` attribute is a [ProjectMetadataSnapshot][kedro.inspection.models.ProjectMetadataSnapshot] with the project name, Python package name, and the Kedro version declared in `pyproject.toml`:
+
+```python
+print(snapshot.metadata.project_name)   # "My Project"
+print(snapshot.metadata.package_name)   # "my_project"
+print(snapshot.metadata.kedro_version)  # "1.0.0"
+```
+
+## How to explore pipeline structure
+
+The `pipelines` attribute is a list of [PipelineSnapshot][kedro.inspection.models.PipelineSnapshot] objects, one per registered pipeline. Each snapshot exposes the pipeline name, its nodes in topological order, and its free inputs and outputs:
+
+```python
+for pipeline in snapshot.pipelines:
+    print(pipeline.name)
+    print("  inputs: ", pipeline.inputs)
+    print("  outputs:", pipeline.outputs)
+    print("  nodes:  ", len(pipeline.nodes))
+```
+
+The output looks as follows:
+
+```console
+__default__
+  inputs:  ['example_iris_data', 'params:example_learning_rate', ...]
+  outputs: ['example_predictions']
+  nodes:   4
+data_engineering
+  ...
+```
+
+To inspect the nodes within a specific pipeline:
+
+```python
+default_pipeline = next(p for p in snapshot.pipelines if p.name == "__default__")
+
+for node in default_pipeline.nodes:
+    print(node.name)
+    print("  func_name:", node.func_name)
+    print("  namespace:", node.namespace)
+    print("  inputs:   ", node.inputs)
+    print("  outputs:  ", node.outputs)
+    print("  tags:     ", node.tags)
+    if node.source:
+        print("  source:   ", node.source.filepath)
+        print("  lines:    ", node.source.line_start, "-", node.source.line_end)
+```
+
+Each node is represented as a [NodeSnapshot][kedro.inspection.models.NodeSnapshot] with `name`, `func_name`, `namespace`, `inputs`, `outputs`, `tags`, and `source` fields.
+
+When present, `source` is a [NodeSourceSnapshot][kedro.inspection.models.NodeSourceSnapshot] with the project-relative path to the node's function and a 1-based inclusive line range. Use it to read the function definition from disk without importing the project package:
+
+```python
+from pathlib import Path
+
+project_path = Path("/path/to/my_project")
+
+if node.source:
+    source_file = project_path / node.source.filepath
+    lines = source_file.read_text().splitlines()
+    function_source = "\n".join(
+        lines[node.source.line_start - 1 : node.source.line_end]
+    )
+```
+
+`source` is `None` when the location cannot be resolved. For example, `functools.partial`, lambdas, built-ins, or functions defined outside the project root.
+
+## How to inspect catalog datasets
+
+The `datasets` attribute is a dictionary mapping dataset names to [DatasetSnapshot][kedro.inspection.models.DatasetSnapshot] objects. Each snapshot contains the dataset type and, where present, its file path:
+
+```python
+for name, dataset in snapshot.datasets.items():
+    print(f"{name}: {dataset.type}")
+    if dataset.filepath:
+        print(f"  filepath: {dataset.filepath}")
+```
+
+The output looks as follows:
+
+```console
+example_iris_data: pandas.CSVDataset
+  filepath: data/01_raw/iris.csv
+example_model: pickle.PickleDataset
+  filepath: data/06_models/example_model.pkl
+example_predictions: pickle.PickleDataset
+  filepath: data/07_model_output/example_predictions.pkl
+```
+
+To look up a specific dataset by name:
+
+```python
+iris = snapshot.datasets["example_iris_data"]
+print(iris.type)      # "pandas.CSVDataset"
+print(iris.filepath)  # "data/01_raw/iris.csv"
+```
+
+!!! note
+
+    Datasets resolved from [dataset factory patterns](../catalog-data/kedro_dataset_factories.md) are included in the snapshot. Datasets that appear as node inputs or outputs but have no catalog entry are not included.
+
+## How to list parameter keys
+
+The `parameters` attribute is a sorted list of parameter key strings. Parameter values are not stored.
+
+```python
+print(snapshot.parameters)
+# ['example_learning_rate', 'example_num_train_iter', 'example_test_data_ratio']
+```
+
+To check whether a specific parameter is configured:
+
+```python
+if "example_learning_rate" in snapshot.parameters:
+    print("learning rate is configured")
+```
+
+## How to inspect a specific environment
+
+By default, `get_project_snapshot` uses the project's default run environment (`local` overlaid on `base`). Pass the `env` argument to load configuration from a different environment:
+
+```python
+snapshot = get_project_snapshot("/path/to/my_project", env="staging")
+```
+
+This follows the same environment resolution rules as `kedro run --env staging`. See [Configuration](../configure/configuration_basics.md#configuration-environments) for details on how environments work.
+
+To load configuration from a non-default directory, pass `conf_source`:
+
+```python
+snapshot = get_project_snapshot("/path/to/my_project", conf_source="conf/custom")
+```
+
+!!! note
+
+    To compare snapshots across environments in the same process, bootstrap the project and pass the result to each call:
+
+    ```python
+    from kedro.framework.startup import bootstrap_project
+    from kedro.inspection import get_project_snapshot
+
+    metadata = bootstrap_project("/path/to/my_project")
+    snapshot_local   = get_project_snapshot(metadata=metadata)
+    snapshot_staging = get_project_snapshot(env="staging", metadata=metadata)
+    ```
+
+    This avoids redundant project initialisation. When using the HTTP server, `env` is fixed at startup and cannot be overridden per request — use the programmatic API when you need multi-environment access in the same process.
+
+## How to pass runtime parameters
+
+When your catalog or parameters configuration uses `${runtime_params:...}` interpolation, pass a `runtime_params` dictionary to resolve those placeholders the same way `kedro run --params` or `KedroSession.create(runtime_params=...)` does:
+
+```python
+snapshot = get_project_snapshot(
+    "/path/to/my_project",
+    runtime_params={"version": "02"},
+)
+```
+
+For example, a catalog entry with `filepath: "data/${runtime_params:version}/companies.csv"` resolves to `data/02/companies.csv` when `version` is `"02"`.
+
+!!! note
+
+    The snapshot still returns parameter **key names** only, not resolved parameter values. `runtime_params` are merged into the parameters configuration the same way as during a run, so a runtime key not already defined in your parameters files will appear as an extra key in parameters.
+
+## How to access the snapshot through the HTTP server
+
+The Kedro HTTP server exposes the same snapshot data at `GET /snapshot`. On success, the response contains the same `metadata`, `pipelines`, `datasets`, and `parameters` fields as `ProjectSnapshot`, serialised as JSON. On failure, the response returns `status` and `error` with no data fields.
+
+See [Serving Kedro pipelines over HTTP](../extend/serving.md#get-snapshot) for the full endpoint reference, example responses, and failure behaviour.

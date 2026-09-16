@@ -1,0 +1,352 @@
+"""This module provides a set of helper functions being used across different components
+of kedro package.
+"""
+
+import difflib
+import importlib
+import logging
+import os
+import re
+import warnings
+from collections.abc import Callable, Iterable
+from functools import wraps
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlsplit
+
+_PYPROJECT = "pyproject.toml"
+
+# Protocols
+HTTP_PROTOCOLS = ("http", "https")
+CLOUD_PROTOCOLS = (
+    "abfs",
+    "abfss",
+    "adl",
+    "gcs",
+    "gdrive",
+    "gs",
+    "oci",
+    "oss",
+    "s3",
+    "s3a",
+    "s3n",
+)
+PROTOCOL_DELIMITER = "://"
+
+# Config extensions
+_CONFIG_EXTENSIONS = (".yml", ".yaml")
+
+
+def _parse_filepath(filepath: str) -> dict[str, str]:
+    """Split filepath on protocol and path. Based on `fsspec.utils.infer_storage_options`.
+
+    Args:
+        filepath: Either local absolute file path or URL (s3://bucket/file.csv)
+
+    Returns:
+        Parsed filepath.
+    """
+    if (
+        re.match(r"^[a-zA-Z]:[\\/]", filepath)
+        or re.match(r"^[a-zA-Z0-9]+://", filepath) is None
+    ):
+        return {"protocol": "file", "path": filepath}
+
+    parsed_path = urlsplit(filepath)
+    protocol = parsed_path.scheme or "file"
+
+    if protocol in HTTP_PROTOCOLS:
+        return {"protocol": protocol, "path": filepath}
+
+    path = parsed_path.path
+    if protocol == "file":
+        windows_path = re.match(r"^/([a-zA-Z])[:|]([\\/].*)$", path)
+        if windows_path:
+            path = ":".join(windows_path.groups())
+
+    if parsed_path.query:
+        path = f"{path}?{parsed_path.query}"
+    if parsed_path.fragment:
+        path = f"{path}#{parsed_path.fragment}"
+
+    options = {"protocol": protocol, "path": path}
+
+    if parsed_path.netloc and protocol in CLOUD_PROTOCOLS:
+        host_with_port = parsed_path.netloc.rsplit("@", 1)[-1]
+        host = host_with_port.rsplit(":", 1)[0]
+        options["path"] = host + options["path"]
+        # - Azure Data Lake Storage Gen2 URIs can store the container name in the
+        #   'username' field of a URL (@ syntax), so we need to add it to the path
+        # - Oracle Cloud Infrastructure (OCI) Object Storage filesystem (ocifs) also
+        #   uses the @ syntax for I/O operations: "oci://bucket@namespace/path_to_file"
+        if protocol in ["abfss", "oci"] and parsed_path.username:
+            options["path"] = parsed_path.username + "@" + options["path"]
+
+    return options
+
+
+def load_obj(obj_path: str, default_obj_path: str = "") -> Any:
+    """Extract an object from a given path.
+
+    Args:
+        obj_path: Path to an object to be extracted, including the object name.
+        default_obj_path: Default object path.
+
+    Returns:
+        Extracted object.
+
+    Raises:
+        AttributeError: When the object does not have the given named attribute.
+
+    """
+    obj_path_list = obj_path.rsplit(".", 1)
+    obj_path = obj_path_list.pop(0) if len(obj_path_list) > 1 else default_obj_path
+    obj_name = obj_path_list[0]
+    module_obj = importlib.import_module(obj_path)
+    return getattr(module_obj, obj_name)
+
+
+def _is_module_allowed(
+    module_path: str, allowed_prefixes: Iterable[str | None]
+) -> bool:
+    """Check a module path against an allowlist of module prefixes.
+
+    This is the shared pre-flight check for components that import a module
+    named by user input. A prefix matches when it is the module path itself or
+    a parent package of it, so ``pkg`` allows ``pkg`` and ``pkg.sub`` but not
+    ``pkgsub``. ``None`` prefixes are ignored, so callers can pass optional
+    values such as a project package name without filtering them out first.
+
+    Args:
+        module_path: Dotted path of the module about to be imported.
+        allowed_prefixes: Module prefixes that are permitted.
+
+    Returns:
+        True when ``module_path`` is covered by one of ``allowed_prefixes``.
+    """
+    return any(
+        prefix is not None
+        and (module_path == prefix or module_path.startswith(prefix + "."))
+        for prefix in allowed_prefixes
+    )
+
+
+def _is_databricks() -> bool:
+    """Evaluate if the current run environment is Databricks or not.
+
+    Useful to tailor environment-dependent activities like Kedro magic commands
+    or logging features that Databricks doesn't support.
+
+    Returns:
+        True if run environment is Databricks, otherwise False.
+    """
+    return "DATABRICKS_RUNTIME_VERSION" in os.environ
+
+
+def is_kedro_project(project_path: str | Path) -> bool:
+    """Evaluate if a given path is a root directory of a Kedro project or not.
+
+    Args:
+        project_path: Path to be tested for being a root of a Kedro project.
+
+    Returns:
+        True if a given path is a root directory of a Kedro project, otherwise False.
+    """
+    metadata_file = Path(project_path).expanduser().resolve() / _PYPROJECT
+    if not metadata_file.is_file():
+        return False
+
+    try:
+        return "[tool.kedro]" in metadata_file.read_text(encoding="utf-8")
+    except Exception:
+        return False
+
+
+def find_kedro_project(current_dir: Path) -> Any:  # pragma: no cover
+    """Given a path, find a Kedro project associated with it.
+
+    Can be:
+        - Itself, if a path is a root directory of a Kedro project.
+        - One of its parents, if self is not a Kedro project but one of the parent path is.
+        - None, if neither self nor any parent path is a Kedro project.
+
+    Returns:
+        Kedro project associated with a given path,
+        or None if no relevant Kedro project is found.
+    """
+    paths_to_check = [current_dir, *list(current_dir.parents)]
+    for parent_dir in paths_to_check:
+        if is_kedro_project(parent_dir):
+            return parent_dir
+    return None
+
+
+def _has_rich_handler(logger: logging.Logger | None = None) -> bool:
+    """Returns true if the logger has a RichHandler attached."""
+    if not logger:
+        logger = logging.getLogger()  # User root by default
+    try:
+        from rich.logging import RichHandler
+    except ImportError:
+        return False
+    return any(isinstance(handler, RichHandler) for handler in logger.handlers)
+
+
+def _format_rich(value: str, markup: str) -> str:
+    """Format string with rich markup"""
+    return f"[{markup}]{value}[/{markup}]"
+
+
+class KedroExperimentalWarning(UserWarning):
+    """Warning raised when using an experimental Kedro feature."""
+
+
+_EXPERIMENTAL_NOTE_MD = """
+!!! warning "Experimental"
+    This feature is **experimental** and may change or be removed in a future release.
+"""
+
+
+def _inject_experimental_doc(obj: Any) -> None:
+    """Inject experimental warning into docstring for MkDocs generation."""
+    doc = obj.__doc__ or ""
+    # Avoid duplicate insertion if it was labelled manually
+    if "experimental" not in doc.lower():
+        obj.__doc__ = f"{_EXPERIMENTAL_NOTE_MD}\n\n{doc}".strip()
+
+
+def experimental(obj: Callable | type) -> Callable | type:
+    """Mark a function or class as experimental.
+
+    Emits a ``KedroExperimentalWarning`` when invoked (for functions) or
+    instantiated (for classes). The original API remains fully usable.
+
+    Args:
+        obj: The function or class to wrap.
+
+    Returns:
+        A wrapped version of the object that emits warnings on use.
+
+    Example:
+    ```python
+
+    @experimental
+    def sample_func(a, b):
+        return a + b
+
+    @experimental
+    class SampleClass:
+    def __init__(self, x):
+        self.x = x
+    ```
+    """
+    warning_message = " is experimental and may change in future Kedro releases."
+    warned_flag = "__kedro_experimental_warned__"
+
+    # Function or method
+    if callable(obj) and not isinstance(obj, type):
+
+        @wraps(obj)
+        def wrapper(*args, **kwargs):  # type: ignore[no-untyped-def]
+            if not getattr(wrapper, warned_flag, False):
+                warnings.warn(
+                    f"{obj.__name__}{warning_message}",
+                    category=KedroExperimentalWarning,
+                    stacklevel=2,
+                )
+                setattr(wrapper, warned_flag, True)
+            return obj(*args, **kwargs)
+
+        setattr(wrapper, "__kedro_experimental__", True)
+        setattr(wrapper, "__wrapped__", obj)
+
+        _inject_experimental_doc(wrapper)
+        return wrapper
+
+    # Class
+    if isinstance(obj, type):
+        original_init = obj.__init__
+
+        @wraps(original_init)
+        def new_init(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            if not getattr(obj, warned_flag, False):
+                warnings.warn(
+                    f"{obj.__name__}{warning_message}",
+                    category=KedroExperimentalWarning,
+                    stacklevel=2,
+                )
+                setattr(obj, warned_flag, True)
+            return original_init(self, *args, **kwargs)
+
+        obj.__init__ = new_init
+        setattr(obj, "__kedro_experimental__", True)
+        setattr(new_init, "_ wrapped _", original_init)
+
+        _inject_experimental_doc(obj)
+        return obj
+
+    return obj
+
+
+def get_close_matches(
+    input: str | list[str],
+    targets: Iterable[str],
+    max_suggestions: int = 3,
+    cutoff: float = 0.6,
+) -> list[str]:
+    """Get close matches from targets for inputs.
+
+    Args:
+        input: Inputs to get close matches for as a single string or list of strings.
+        targets: Targets to get close matches from as a list of strings.
+        max_suggestions: Maximum number of suggestions to return, defaults to 3.
+        cutoff: Cutoff value for the similarity ratio, defaults to 0.6.
+    Returns:
+        List of close matches or empty list if no matches are found.
+    """
+    # Materialize once: `targets` may be a one-shot iterable, and it is reused
+    # for every input string below.
+    targets = list(targets)
+    inputs = [input] if isinstance(input, str) else input
+
+    matches: list[str] = []
+    seen: set[str] = set()
+    for source_str in inputs:
+        for match in difflib.get_close_matches(
+            source_str, targets, n=max_suggestions, cutoff=cutoff
+        ):
+            # Deduplicate while preserving order: different inputs can match the
+            # same target, which would otherwise repeat it in the suggestions.
+            # A `seen` set keeps the membership check O(1).
+            if match not in seen:
+                seen.add(match)
+                matches.append(match)
+    return matches[:max_suggestions]
+
+
+def find_config_file(
+    filename: str, extensions: tuple[str, ...] = _CONFIG_EXTENSIONS
+) -> Path | None:
+    """Find a config file in the current working directory.
+
+    Args:
+        filename: The name of the config file to find.
+        extensions: The extensions of the config file to find.
+
+    Returns:
+        The path to the config file if found, otherwise None.
+    """
+    path = Path(filename)
+    return next(
+        (path.with_suffix(ext) for ext in extensions if path.with_suffix(ext).exists()),
+        None,
+    )
+
+
+def _is_unsafe_version(version: str) -> bool:
+    """Return True if the version string is not a safe single path component.
+
+    A valid version must be a non-empty string with no path separators (``/`` or ``\\``)
+    and must not be a dot-only component (``.`` or ``..``).
+    """
+    return not version or "/" in version or "\\" in version or version in (".", "..")

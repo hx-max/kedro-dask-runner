@@ -1,0 +1,546 @@
+from __future__ import annotations
+
+import logging
+import sys
+import textwrap
+from logging.handlers import QueueHandler, QueueListener
+from multiprocessing import Queue
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+from unittest.mock import create_autospec
+
+import pytest
+import tomli_w
+import yaml
+from dynaconf.validator import Validator
+
+from kedro import __version__ as kedro_version
+from kedro.config import AbstractConfigLoader
+from kedro.framework.context import KedroContext
+from kedro.framework.hooks import hook_impl
+from kedro.framework.project import (
+    _HasSharedParentClassValidator,
+    _ProjectPipelines,
+    _ProjectSettings,
+    configure_project,
+)
+from kedro.framework.session import KedroSession
+from kedro.pipeline import Pipeline, pipeline
+from kedro.pipeline.node import Node, node
+from tests.test_utils import identity
+
+if TYPE_CHECKING:
+    from kedro.io import DataCatalog
+
+logger = logging.getLogger(__name__)
+
+MOCK_PACKAGE_NAME = "fake_package"
+MOCK_PROJECT_NAME = "fake_project"
+
+
+class BadConfigLoader:
+    """
+    ConfigLoader class that doesn't subclass `AbstractConfigLoader`, for testing only.
+    """
+
+
+@pytest.fixture
+def mock_package_name() -> str:
+    return MOCK_PACKAGE_NAME
+
+
+def _write_yaml(filepath: Path, config: dict):
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    yaml_str = yaml.dump(config)
+    filepath.write_text(yaml_str)
+
+
+def _write_toml(filepath: Path, config: dict):
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    with filepath.open("wb") as f:
+        tomli_w.dump(config, f)
+
+
+def _assert_hook_call_record_has_expected_parameters(
+    call_record: logging.LogRecord, expected_parameters: list[str]
+):
+    """Assert the given call record has all expected parameters."""
+    for param in expected_parameters:
+        assert hasattr(call_record, param)
+
+
+def _assert_pipeline_equal(p: Pipeline, q: Pipeline):
+    assert sorted(p.nodes) == sorted(q.nodes)
+
+
+@pytest.fixture
+def local_config(tmp_path):
+    cars_filepath = str(tmp_path / "cars.csv")
+    boats_filepath = str(tmp_path / "boats.csv")
+    return {
+        "cars": {
+            "type": "pandas.CSVDataset",
+            "filepath": cars_filepath,
+            "save_args": {"index": False},
+            "versioned": True,
+        },
+        "boats": {
+            "type": "pandas.CSVDataset",
+            "filepath": boats_filepath,
+            "versioned": True,
+        },
+    }
+
+
+@pytest.fixture(autouse=True)
+def config_dir(tmp_path, local_config):
+    catalog = tmp_path / "conf" / "base" / "catalog.yml"
+    credentials = tmp_path / "conf" / "local" / "credentials.yml"
+    pyproject_toml = tmp_path / "pyproject.toml"
+    _write_yaml(catalog, local_config)
+    _write_yaml(credentials, {"dev_s3": "foo"})
+    payload = {
+        "tool": {
+            "kedro": {
+                "kedro_init_version": kedro_version,
+                "project_name": "test hooks",
+                "package_name": "test_hooks",
+            }
+        }
+    }
+    _write_toml(pyproject_toml, payload)
+
+
+def assert_exceptions_equal(e1: Exception, e2: Exception):
+    assert isinstance(e1, type(e2)) and str(e1) == str(e2)
+
+
+@pytest.fixture
+def mock_pipeline() -> Pipeline:
+    return pipeline(
+        [
+            node(identity, "cars", "planes", name="node1"),
+            node(identity, "boats", "ships", name="node2"),
+        ],
+        tags="pipeline",
+    )
+
+
+class LogRecorder(logging.Handler):
+    """Record logs received from a process-safe log listener"""
+
+    def __init__(self):
+        super().__init__()
+        self.log_records = []
+
+    def handle(self, record):
+        self.log_records.append(record)
+
+
+class LogsListener(QueueListener):
+    """Listen to logs stream and capture log records with LogRecorder."""
+
+    def __init__(self):
+        # Queue where logs will be sent to
+        queue = Queue()
+
+        # Tells python logging to send logs to this queue
+        self.log_handler = QueueHandler(queue)
+        logger.addHandler(self.log_handler)
+
+        # The listener listens to new logs on the queue and saves it to the recorder
+        self.log_recorder = LogRecorder()
+        super().__init__(queue, self.log_recorder)
+
+    @property
+    def logs(self):
+        return self.log_recorder.log_records
+
+
+@pytest.fixture
+def logs_listener():
+    """Fixture to start the logs listener before a test and clean up after the test finishes"""
+    listener = LogsListener()
+    listener.start()
+    yield listener
+    logger.removeHandler(listener.log_handler)
+    listener.stop()
+
+
+class LoggingHooks:
+    """A set of test hooks that only log information when invoked"""
+
+    @hook_impl
+    def after_catalog_created(
+        self,
+        catalog: DataCatalog,
+        conf_catalog: dict[str, Any],
+        conf_creds: dict[str, Any],
+        parameters: dict[str, Any],
+        save_version: str,
+        load_versions: dict[str, str],
+    ):
+        logger.info(
+            "Catalog created",
+            extra={
+                "catalog": catalog,
+                "conf_catalog": conf_catalog,
+                "conf_creds": conf_creds,
+                "parameters": parameters,
+                "save_version": save_version,
+                "load_versions": load_versions,
+            },
+        )
+
+    @hook_impl
+    def before_node_run(
+        self,
+        node: Node,
+        catalog: DataCatalog,
+        inputs: dict[str, Any],
+        is_async: str,
+        run_id: str,
+    ) -> None:
+        logger.info(
+            "About to run node",
+            extra={
+                "node": node,
+                "catalog": catalog,
+                "inputs": inputs,
+                "is_async": is_async,
+                "run_id": run_id,
+            },
+        )
+
+    @hook_impl
+    def after_node_run(
+        self,
+        node: Node,
+        catalog: DataCatalog,
+        inputs: dict[str, Any],
+        outputs: dict[str, Any],
+        is_async: str,
+        run_id: str,
+    ) -> None:
+        logger.info(
+            "Ran node",
+            extra={
+                "node": node,
+                "catalog": catalog,
+                "inputs": inputs,
+                "outputs": outputs,
+                "is_async": is_async,
+                "run_id": run_id,
+            },
+        )
+
+    @hook_impl
+    def on_node_error(
+        self,
+        error: Exception,
+        node: Node,
+        catalog: DataCatalog,
+        inputs: dict[str, Any],
+        is_async: bool,
+        run_id: str,
+    ):
+        logger.info(
+            "Node error",
+            extra={
+                "error": error,
+                "node": node,
+                "catalog": catalog,
+                "inputs": inputs,
+                "is_async": is_async,
+                "run_id": run_id,
+            },
+        )
+
+    @hook_impl
+    def before_pipeline_run(
+        self, run_params: dict[str, Any], pipeline: Pipeline, catalog: DataCatalog
+    ) -> None:
+        logger.info(
+            "About to run pipeline",
+            extra={"pipeline": pipeline, "run_params": run_params, "catalog": catalog},
+        )
+
+    @hook_impl
+    def after_pipeline_run(
+        self,
+        run_params: dict[str, Any],
+        run_result: dict[str, Any],
+        pipeline: Pipeline,
+        catalog: DataCatalog,
+    ) -> None:
+        logger.info(
+            "Ran pipeline",
+            extra={
+                "pipeline": pipeline,
+                "run_params": run_params,
+                "run_result": run_result,
+                "catalog": catalog,
+            },
+        )
+
+    @hook_impl
+    def on_pipeline_error(
+        self,
+        error: Exception,
+        run_params: dict[str, Any],
+        pipeline: Pipeline,
+        catalog: DataCatalog,
+    ) -> None:
+        logger.info(
+            "Pipeline error",
+            extra={
+                "error": error,
+                "run_params": run_params,
+                "pipeline": pipeline,
+                "catalog": catalog,
+            },
+        )
+
+    @hook_impl
+    def before_dataset_loaded(self, dataset_name: str, node: Node) -> None:
+        logger.info(
+            "Before dataset loaded", extra={"dataset_name": dataset_name, "node": node}
+        )
+
+    @hook_impl
+    def after_dataset_loaded(self, dataset_name: str, data: Any, node: Node) -> None:
+        logger.info(
+            "After dataset loaded",
+            extra={"dataset_name": dataset_name, "data": data, "node": node},
+        )
+
+    @hook_impl
+    def before_dataset_saved(self, dataset_name: str, data: Any, node: Node) -> None:
+        logger.info(
+            "Before dataset saved",
+            extra={"dataset_name": dataset_name, "data": data, "node": node},
+        )
+
+    @hook_impl
+    def after_dataset_saved(self, dataset_name: str, data: Any, node: Node) -> None:
+        logger.info(
+            "After dataset saved",
+            extra={"dataset_name": dataset_name, "data": data, "node": node},
+        )
+
+    @hook_impl
+    def after_context_created(self, context: KedroContext) -> None:
+        logger.info("After context created", extra={"context": context})
+
+
+@pytest.fixture
+def project_hooks():
+    """A set of project hook implementations that log to stdout whenever it is invoked."""
+    return LoggingHooks()
+
+
+@pytest.fixture(autouse=True)
+def mock_pipelines(mocker, mock_pipeline):
+    def mock_register_pipelines():
+        return {
+            "__default__": mock_pipeline,
+            "pipe": mock_pipeline,
+        }
+
+    mocker.patch.object(
+        _ProjectPipelines,
+        "_get_pipelines_registry_callable",
+        return_value=mock_register_pipelines,
+    )
+    return mock_register_pipelines()
+
+
+def _mock_imported_settings_paths(mocker, mock_settings):
+    for path in [
+        "kedro.framework.session.session.settings",
+        "kedro.framework.session.service_session.settings",
+        "kedro.framework.project.settings",
+        "kedro.runner.task.settings",
+    ]:
+        mocker.patch(path, mock_settings)
+    return mock_settings
+
+
+@pytest.fixture
+def mock_settings(mocker, project_hooks):
+    class MockSettings(_ProjectSettings):
+        _HOOKS = Validator("HOOKS", default=(project_hooks,))
+
+    return _mock_imported_settings_paths(mocker, MockSettings())
+
+
+@pytest.fixture
+def mock_session(mocker, mock_settings, mock_package_name, tmp_path):
+    mocker.patch(
+        "kedro.framework.project.LOGGING.set_project_logging", return_value=None
+    )
+
+    configure_project(mock_package_name)
+    session = KedroSession.create(tmp_path, runtime_params={"params:key": "value"})
+    yield session
+    session.close()
+
+
+@pytest.fixture
+def mock_settings_context_class(mocker, mock_context_class):
+    class MockSettings(_ProjectSettings):
+        # dynaconf automatically deleted some attribute when the class is MagicMock
+        _CONTEXT_CLASS = Validator(
+            "CONTEXT_CLASS", default=lambda *_: mock_context_class
+        )
+
+    return _mock_imported_settings_paths(mocker, MockSettings())
+
+
+@pytest.fixture(autouse=True)
+def mock_validate_settings(mocker):
+    # KedroSession eagerly validates that a project's settings.py is correct by
+    # importing it. settings.py does not actually exists as part of this test suite
+    # since we are testing session in isolation, so the validation is patched.
+    mocker.patch("kedro.framework.session.session.validate_settings")
+    mocker.patch("kedro.framework.session.service_session.validate_settings")
+
+
+@pytest.fixture
+def fake_project(tmp_path, mock_package_name):
+    fake_project_dir = Path(tmp_path) / MOCK_PROJECT_NAME
+    (fake_project_dir / "src").mkdir(parents=True)
+
+    pyproject_toml_path = fake_project_dir / "pyproject.toml"
+    payload = {
+        "tool": {
+            "kedro": {
+                "kedro_init_version": kedro_version,
+                "project_name": MOCK_PROJECT_NAME,
+                "package_name": mock_package_name,
+            }
+        }
+    }
+    with pyproject_toml_path.open("wb") as f:
+        tomli_w.dump(payload, f)
+
+    (fake_project_dir / "conf" / "base").mkdir(parents=True)
+    (fake_project_dir / "conf" / "local").mkdir()
+    return fake_project_dir
+
+
+ATTRS_ATTRIBUTE = "__attrs_attrs__"
+NEW_TYPING = sys.version_info[:3] >= (3, 7, 0)  # PEP 560
+
+
+def create_attrs_autospec(spec: type, spec_set: bool = True) -> Any:
+    """Creates a mock of an attr class (creates mocks recursively on all attributes).
+    https://github.com/python-attrs/attrs/issues/462#issuecomment-1134656377
+
+    :param spec: the spec to mock
+    :param spec_set: if True, AttributeError will be raised if an attribute that is not in the spec is set.
+    """
+
+    if not hasattr(spec, ATTRS_ATTRIBUTE):
+        raise TypeError(f"{spec!r} is not an attrs class")
+    mock = create_autospec(spec, spec_set=spec_set)
+    for attribute in getattr(spec, ATTRS_ATTRIBUTE):
+        attribute_type = attribute.type
+        if NEW_TYPING:
+            # A[T] does not get a copy of __dict__ from A(Generic[T]) anymore, use __origin__ to get it
+            while hasattr(attribute_type, "__origin__"):
+                attribute_type = attribute_type.__origin__
+        if hasattr(attribute_type, ATTRS_ATTRIBUTE):
+            mock_attribute = create_attrs_autospec(attribute_type, spec_set)
+        else:
+            mock_attribute = create_autospec(attribute_type, spec_set=spec_set)
+        object.__setattr__(mock, attribute.name, mock_attribute)
+    return mock
+
+
+@pytest.fixture
+def mock_context_class(mocker):
+    mock_cls = create_attrs_autospec(KedroContext)
+    return mocker.patch(
+        "kedro.framework.context.KedroContext", autospec=True, return_value=mock_cls
+    )
+
+
+@pytest.fixture
+def mock_settings_custom_context_class(mocker):
+    class MyContext(KedroContext):
+        pass
+
+    class MockSettings(_ProjectSettings):
+        _CONTEXT_CLASS = Validator("CONTEXT_CLASS", default=lambda *_: MyContext)
+
+    return _mock_imported_settings_paths(mocker, MockSettings())
+
+
+@pytest.fixture
+def mock_settings_custom_config_loader_class(mocker):
+    class MyConfigLoader(AbstractConfigLoader):
+        pass
+
+    class MockSettings(_ProjectSettings):
+        _CONFIG_LOADER_CLASS = _HasSharedParentClassValidator(
+            "CONFIG_LOADER_CLASS", default=lambda *_: MyConfigLoader
+        )
+
+    return _mock_imported_settings_paths(mocker, MockSettings())
+
+
+@pytest.fixture
+def mock_settings_config_loader_args(mocker):
+    class MockSettings(_ProjectSettings):
+        _CONFIG_LOADER_ARGS = Validator(
+            "CONFIG_LOADER_ARGS",
+            default={"config_patterns": {"spark": ["spark/*"]}},
+        )
+
+    return _mock_imported_settings_paths(mocker, MockSettings())
+
+
+@pytest.fixture
+def mock_settings_config_loader_args_env(mocker):
+    class MockSettings(_ProjectSettings):
+        _CONFIG_LOADER_ARGS = Validator(
+            "CONFIG_LOADER_ARGS",
+            default={"base_env": "something_new"},
+        )
+
+    return _mock_imported_settings_paths(mocker, MockSettings())
+
+
+@pytest.fixture
+def mock_settings_file_bad_config_loader_class(tmpdir):
+    mock_settings_file = tmpdir.join("mock_settings_file.py")
+    mock_settings_file.write(
+        textwrap.dedent(
+            f"""
+            from {__name__} import BadConfigLoader
+            CONFIG_LOADER_CLASS = BadConfigLoader
+            """
+        )
+    )
+    return mock_settings_file
+
+
+@pytest.fixture
+def mock_runner(mocker):
+    mock_runner = mocker.patch(
+        "kedro.runner.sequential_runner.SequentialRunner",
+        autospec=True,
+    )
+    mock_runner.__name__ = "MockRunner"
+    return mock_runner
+
+
+@pytest.fixture
+def mock_thread_runner(mocker):
+    mock_runner = mocker.patch(
+        "kedro.runner.thread_runner.ThreadRunner",
+        autospec=True,
+    )
+    mock_runner.__name__ = "MockThreadRunner`"
+    return mock_runner

@@ -1,0 +1,759 @@
+"""``kedro.framework.project`` module provides utility to
+configure a Kedro project and access its settings."""
+
+from __future__ import annotations
+
+import importlib.resources
+import logging.config
+import operator
+import os
+import threading
+import traceback
+import warnings
+from collections import UserDict
+from collections.abc import MutableMapping
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+import dynaconf
+import yaml
+from dynaconf import LazySettings
+from dynaconf.validator import ValidationError, Validator
+
+from kedro.io import CatalogProtocol
+from kedro.pipeline import Pipeline, pipeline
+from kedro.utils import _is_module_allowed, find_config_file
+
+if TYPE_CHECKING:
+    import types
+
+IMPORT_ERROR_MESSAGE = (
+    "An error occurred while importing the '{module}' module. Nothing "
+    "defined therein will be returned by 'find_pipelines'.\n\n{tb_exc}"
+)
+
+_LOGGING_BASE_CLASSES = (
+    logging.Handler,
+    logging.Formatter,
+    logging.Filter,
+)
+
+# Modules trusted by default to supply logging handler/formatter/filter classes.
+# Extended via the KEDRO_LOGGING_MODULE_ALLOWLIST env var.
+_DEFAULT_LOGGING_MODULE_ALLOWLIST = ("logging", "kedro.logging")
+
+
+def _get_default_class(class_import_path: str) -> Any:
+    module, _, class_name = class_import_path.rpartition(".")
+
+    def validator_func(settings: dynaconf.base.Settings, validators: Any) -> Any:
+        return getattr(importlib.import_module(module), class_name)
+
+    return validator_func
+
+
+class _IsSubclassValidator(Validator):
+    """A validator to check if the supplied setting value is a subclass of the default class"""
+
+    def validate(
+        self, settings: dynaconf.base.Settings, *args: Any, **kwargs: Any
+    ) -> None:
+        super().validate(settings, *args, **kwargs)
+
+        default_class = self.default(settings, self)
+        for name in self.names:
+            setting_value = getattr(settings, name)
+            if not issubclass(setting_value, default_class):
+                raise ValidationError(
+                    f"Invalid value '{setting_value.__module__}.{setting_value.__qualname__}' "
+                    f"received for setting '{name}'. It must be a subclass of "
+                    f"'{default_class.__module__}.{default_class.__qualname__}'."
+                )
+
+
+class _ImplementsCatalogProtocolValidator(Validator):
+    """A validator to check if the supplied setting value is a subclass of the default class"""
+
+    def validate(
+        self, settings: dynaconf.base.Settings, *args: Any, **kwargs: Any
+    ) -> None:
+        super().validate(settings, *args, **kwargs)
+
+        protocol = CatalogProtocol
+        for name in self.names:
+            setting_value = getattr(settings, name)
+            if not isinstance(setting_value(), protocol):
+                raise ValidationError(
+                    f"Invalid value '{setting_value.__module__}.{setting_value.__qualname__}' "
+                    f"received for setting '{name}'. It must implement "
+                    f"'{protocol.__module__}.{protocol.__qualname__}'."
+                )
+
+
+class _HasSharedParentClassValidator(Validator):
+    """A validator to check that the parent of the default class is an ancestor of
+    the settings value."""
+
+    def validate(
+        self, settings: dynaconf.base.Settings, *args: Any, **kwargs: Any
+    ) -> None:
+        super().validate(settings, *args, **kwargs)
+
+        default_class = self.default(settings, self)
+        for name in self.names:
+            setting_value = getattr(settings, name)
+            # In the case of ConfigLoader, default_class.mro() will be:
+            # [kedro.config.config.ConfigLoader,
+            # kedro.config.abstract_config.AbstractConfigLoader,
+            # abc.ABC,
+            # object]
+            # We pick out the direct parent and check if it's in any of the ancestors of
+            # the supplied setting_value. This assumes that the direct parent is
+            # the abstract class that must be inherited from.
+            # A more general check just for a shared ancestor would be:
+            # set(default_class.mro()) & set(setting_value.mro()) - {abc.ABC, object}
+            default_class_parent = default_class.mro()[1]
+            if default_class_parent not in setting_value.mro():
+                raise ValidationError(
+                    f"Invalid value '{setting_value.__module__}.{setting_value.__qualname__}' "
+                    f"received for setting '{name}'. It must be a subclass of "
+                    f"'{default_class_parent.__module__}.{default_class_parent.__qualname__}'."
+                )
+
+
+class _ProjectSettings(LazySettings):
+    """Define all settings available for users to configure in Kedro,
+    along with their validation rules and default values.
+    Use Dynaconf's LazySettings as base.
+    """
+
+    _CONF_SOURCE = Validator("CONF_SOURCE", default="conf")
+    _HOOKS = Validator("HOOKS", default=tuple())
+    _CONTEXT_CLASS = _IsSubclassValidator(
+        "CONTEXT_CLASS",
+        default=_get_default_class("kedro.framework.context.KedroContext"),
+    )
+    _SESSION_CLASS = _HasSharedParentClassValidator(
+        "SESSION_CLASS",
+        default=_get_default_class("kedro.framework.session.KedroSession"),
+    )
+    _SESSION_STORE_CLASS = _IsSubclassValidator(
+        "SESSION_STORE_CLASS",
+        default=_get_default_class("kedro.framework.session.store.BaseSessionStore"),
+    )
+    _SESSION_STORE_ARGS = Validator("SESSION_STORE_ARGS", default={})
+    _DISABLE_HOOKS_FOR_PLUGINS = Validator("DISABLE_HOOKS_FOR_PLUGINS", default=tuple())
+    _RUNNER_MODULE_ALLOWLIST = Validator("RUNNER_MODULE_ALLOWLIST", default=tuple())
+    _CONFIG_LOADER_CLASS = _HasSharedParentClassValidator(
+        "CONFIG_LOADER_CLASS",
+        default=_get_default_class("kedro.config.OmegaConfigLoader"),
+    )
+    _CONFIG_LOADER_ARGS = Validator(
+        "CONFIG_LOADER_ARGS", default={"base_env": "base", "default_run_env": "local"}
+    )
+    _DATA_CATALOG_CLASS = _ImplementsCatalogProtocolValidator(
+        "DATA_CATALOG_CLASS",
+        default=_get_default_class("kedro.io.DataCatalog"),
+    )
+    # Boolean for now; "warn"/"strict" modes are planned as a follow-up.
+    _DATASET_VALIDATION = Validator("DATASET_VALIDATION", default=True)
+
+    def __init__(self, *args: Any, **kwargs: Any):
+        kwargs.update(
+            validators=[
+                self._CONF_SOURCE,
+                self._HOOKS,
+                self._CONTEXT_CLASS,
+                self._SESSION_CLASS,
+                self._SESSION_STORE_CLASS,
+                self._SESSION_STORE_ARGS,
+                self._DISABLE_HOOKS_FOR_PLUGINS,
+                self._RUNNER_MODULE_ALLOWLIST,
+                self._CONFIG_LOADER_CLASS,
+                self._CONFIG_LOADER_ARGS,
+                self._DATA_CATALOG_CLASS,
+                self._DATASET_VALIDATION,
+            ]
+        )
+        super().__init__(*args, **kwargs)
+
+
+def _load_data_wrapper(func: Any) -> Any:
+    """Wrap a method in _ProjectPipelines so that data is loaded on first access.
+    Taking inspiration from dynaconf.utils.functional.new_method_proxy
+    """
+
+    def inner(self: Any, *args: Any, **kwargs: Any) -> Any:
+        with self._lock:
+            content = self._load_data()
+            return func(content, *args, **kwargs)
+
+    return inner
+
+
+class _ProjectPipelines(MutableMapping):
+    """A read-only lazy dictionary-like object to hold the project pipelines.
+    When configured, it stores the pipelines module.
+    On first data access, e.g. through __getitem__, it will load the registered pipelines
+
+    This object is initialized lazily for a few reasons:
+
+    1. To support an unified way of importing via `from kedro.framework.project import pipelines`.
+       The pipelines object is initializedlazily since the framework doesn't have knowledge about
+       the project until `bootstrap_project` is run.
+    2. To speed up Kedro CLI performance. Loading the pipelines incurs overhead, as all related
+       modules need to be imported.
+    3. To ensure Kedro CLI remains functional when pipelines are broken. During development, broken
+       pipelines are common, but they shouldn't prevent other parts of Kedro CLI from functioning
+       properly (e.g. `kedro -h`).
+
+    Note:
+        Accessing `pipelines` from module-level code that runs during an import (e.g. a
+        helper module imported by `pipeline_registry.py` that reads `pipelines[...]` at
+        import time) is not supported and can deadlock. `_load_data()` holds the instance
+        lock across `importlib.import_module` and the user-supplied `register_pipelines()`
+        call, so if another thread is meanwhile importing that same module and blocked on
+        Python's per-module import lock waiting to acquire our instance lock, the two
+        threads wait on each other forever. The lock here only protects against per-call
+        state races (double loading, torn reads); it does not make import-time access to
+        `pipelines` safe.
+    """
+
+    def __init__(self) -> None:
+        self._pipelines_module: str | None = None
+        self._is_data_loaded = False
+        self._content: dict[str, Pipeline] = {}
+        self._requested_pipelines: list[str] | None = None
+        # RLock because `inner` (in _load_data_wrapper) takes the lock and then calls
+        # _load_data(), which takes it again on the same thread — this happens on every
+        # load. It also lets configure()/set_requested() be re-entered from the same
+        # thread, e.g. if a user's register_pipelines() calls back into either of them.
+        self._lock = threading.RLock()
+
+    @staticmethod
+    def _get_pipelines_registry_callable(pipelines_module: str) -> Any:
+        module_obj = importlib.import_module(pipelines_module)
+        register_pipelines = getattr(module_obj, "register_pipelines")
+        return register_pipelines
+
+    def _load_data(self) -> dict[str, Pipeline]:
+        """Lazily read pipelines defined in the pipelines registry module.
+
+        Returns:
+            The loaded pipelines dictionary, or the current (possibly empty)
+            ``_content`` unchanged if not configured or already loaded.
+        """
+        with self._lock:
+            if self._pipelines_module is None or self._is_data_loaded:
+                return self._content
+            register_pipelines = self._get_pipelines_registry_callable(
+                self._pipelines_module
+            )
+            self._content = register_pipelines()
+            self._is_data_loaded = True
+            return self._content
+
+    def set_requested(self, pipeline_names: list[str] | None) -> None:
+        """Store which pipelines should be loaded on the next dict access.
+
+        Invalidates the cache when the filter changes so that a subsequent
+        access with a different (or absent) filter re-runs ``_load_data``.
+
+        Args:
+            pipeline_names: Names of the pipelines to load selectively, or
+                ``None`` to load all registered pipelines.
+        """
+        with self._lock:
+            if set(self._requested_pipelines or []) != set(pipeline_names or []):
+                self._is_data_loaded = False
+                self._content = {}
+            self._requested_pipelines = (
+                list(pipeline_names) if pipeline_names is not None else None
+            )
+
+    def configure(self, pipelines_module: str | None = None) -> None:
+        """Configure the pipelines_module to load the pipelines dictionary.
+        Reset the data loading state so that after every ``configure`` call,
+        data are reloaded.
+        """
+        with self._lock:
+            self._pipelines_module = pipelines_module
+            self._is_data_loaded = False
+            self._content = {}
+            self._requested_pipelines = None
+
+    # Dict-like interface
+    __getitem__ = _load_data_wrapper(operator.getitem)
+    __setitem__ = _load_data_wrapper(operator.setitem)
+    __delitem__ = _load_data_wrapper(operator.delitem)
+    __len__ = _load_data_wrapper(len)
+    # These return snapshots (not live views over `content`) so that iterating/reading
+    # them after the lock is released is safe even if a concurrent configure()/
+    # set_requested() mutates `self._content` in place in the meantime.
+    __iter__ = _load_data_wrapper(lambda content: iter(dict(content)))
+    keys = _load_data_wrapper(lambda content: dict(content).keys())
+    values = _load_data_wrapper(lambda content: dict(content).values())
+    items = _load_data_wrapper(lambda content: dict(content).items())
+
+    # Presentation methods
+    __repr__ = _load_data_wrapper(repr)
+    __str__ = _load_data_wrapper(str)
+
+
+class _ProjectLogging(UserDict):
+    def __init__(self) -> None:
+        """Initialise project logging. The path to logging configuration is given in
+        environment variable KEDRO_LOGGING_CONFIG (defaults to conf/logging.yml)."""
+        logger = logging.getLogger(__name__)
+
+        # Extra trusted logging modules, on top of _DEFAULT_LOGGING_MODULE_ALLOWLIST.
+        _logging_module_allowlist_env = os.environ.get(
+            "KEDRO_LOGGING_MODULE_ALLOWLIST", ""
+        )
+        _extra_allowlist_logging_modules = tuple(
+            module.strip()
+            for module in _logging_module_allowlist_env.split(",")
+            if module.strip()
+        )
+        self._logging_module_allowlist = (
+            _DEFAULT_LOGGING_MODULE_ALLOWLIST + _extra_allowlist_logging_modules
+        )
+
+        user_logging_path = os.environ.get("KEDRO_LOGGING_CONFIG")
+        project_logging_path = find_config_file("conf/logging")
+        default_logging_path = Path(
+            Path(__file__).parent / "rich_logging.yml"
+            if importlib.util.find_spec("rich")
+            else Path(__file__).parent / "default_logging.yml",
+        )
+        path: str | Path
+        msg = ""
+
+        if user_logging_path:
+            path = user_logging_path
+
+        elif project_logging_path is not None:
+            path = project_logging_path
+            msg = "You can change this by setting the KEDRO_LOGGING_CONFIG environment variable accordingly."
+        else:
+            # Fallback to the framework default loggings
+            path = default_logging_path
+
+        msg = f"Using '{path!s}' as logging configuration. " + msg
+
+        # Load and apply the logging configuration
+        logging_config = Path(path).read_text(encoding="utf-8")
+        self.configure(yaml.safe_load(logging_config))
+        logger.info(msg)
+
+    def _resolve_logging_class(self, class_path: str) -> type[Any] | None:
+        """Resolve and validate that a class referenced in logging configuration is
+        a legitimate logging class (i.e. a subclass of logging.Handler,
+        logging.Formatter, or logging.Filter).
+
+        Args:
+            class_path: Dotted import path to the class, e.g. ``logging.StreamHandler``.
+
+        Returns:
+            Resolved class, or ``None`` for bare names resolved internally by logging.
+
+        Raises:
+            ValueError: If the class cannot be imported or is not a logging base class.
+        """
+
+        module_path, _, class_name = class_path.rpartition(".")
+        if not module_path:
+            # Bare name (e.g. "StreamHandler") resolved internally by logging machinery.
+            return None
+
+        # Check against the allowlist before importing, so an untrusted module's
+        # top-level code can't run regardless of what the class check finds.
+        if not _is_module_allowed(module_path, self._logging_module_allowlist):
+            raise ValueError(
+                f"Module '{module_path}' specified as a logging class is not "
+                "permitted. Only 'logging', 'kedro.logging', and modules listed "
+                "in the KEDRO_LOGGING_MODULE_ALLOWLIST environment variable are "
+                "allowed."
+            )
+
+        try:
+            module = importlib.import_module(module_path)
+        except ImportError as exc:
+            raise ValueError(
+                f"Cannot import module '{module_path}' specified as a logging class: {exc}"
+            ) from exc
+
+        cls = getattr(module, class_name, None)
+        if cls is None:
+            raise ValueError(
+                f"Class '{class_name}' not found in module '{module_path}' "
+                f"as specified in logging configuration."
+            )
+
+        if not (isinstance(cls, type) and issubclass(cls, _LOGGING_BASE_CLASSES)):
+            raise ValueError(
+                f"Invalid logging class '{class_path}'. "
+                f"Must be a subclass of logging.Handler, logging.Formatter, or logging.Filter. "
+                f"Got {type(cls).__name__!r}."
+            )
+
+        return cls
+
+    def _validate_logging_class(self, class_path: str) -> type[Any] | None:
+        """Validate that a class referenced in logging configuration is a legitimate
+        logging class (i.e. a subclass of logging.Handler, logging.Formatter, or
+        logging.Filter)."""
+        return self._resolve_logging_class(class_path)
+
+    def _validate_logging_config(
+        self,
+        config: Any,
+        resolved_logging_classes: dict[str, type[Any] | None] | None = None,
+    ) -> Any:
+        """Recursively check the logging configuration and raise an error if dangerous
+        '()' factory keys are encountered or if any 'class' value is not a legitimate
+        logging class."""
+        if isinstance(config, dict):
+            if "()" in config:
+                raise ValueError(
+                    "The '()' key is not allowed in logging configuration as it poses a security risk."
+                )
+            if "class" in config:
+                class_path = config["class"]
+                resolved_class = self._validate_logging_class(class_path)
+                if resolved_logging_classes is not None:
+                    resolved_logging_classes[class_path] = resolved_class
+            validated = {}
+            for k, v in config.items():
+                validated[k] = self._validate_logging_config(
+                    v, resolved_logging_classes
+                )
+            return validated
+        elif isinstance(config, list):
+            return [
+                self._validate_logging_config(item, resolved_logging_classes)
+                for item in config
+            ]
+        else:
+            return config
+
+    def _prepare_logging_config(
+        self,
+        logging_config: dict[str, Any],
+        resolved_logging_classes: dict[str, type[Any] | None] | None = None,
+    ) -> dict[str, Any]:
+        """Prepare a validated logging configuration for ``dictConfig``.
+
+        ``logging.config.dictConfig`` only instantiates custom filters through the
+        ``()`` factory key, which Kedro rejects in user configuration for security
+        reasons. For validated top-level filter definitions, convert ``class`` to an
+        internal callable so custom ``logging.Filter`` subclasses are instantiated
+        without allowing user-provided factories.
+        """
+        prepared_config = logging_config.copy()
+
+        if "filters" not in logging_config:
+            return prepared_config
+
+        filters = logging_config["filters"]
+
+        if not isinstance(filters, dict):
+            return prepared_config
+
+        prepared_filters = filters.copy()
+        prepared_config["filters"] = prepared_filters
+
+        for filter_name, filter_config in prepared_filters.items():
+            if not isinstance(filter_config, dict) or "class" not in filter_config:
+                continue
+
+            class_path = filter_config["class"]
+            filter_class = (
+                resolved_logging_classes[class_path]
+                if resolved_logging_classes is not None
+                and class_path in resolved_logging_classes
+                else self._resolve_logging_class(class_path)
+            )
+
+            if filter_class is None:
+                continue
+
+            if not issubclass(filter_class, logging.Filter):
+                raise ValueError(
+                    f"Invalid logging filter class '{class_path}' for filter "
+                    f"'{filter_name}'. Must be a subclass of logging.Filter."
+                )
+
+            prepared_filter_config = {
+                key: value for key, value in filter_config.items() if key != "class"
+            }
+            prepared_filter_config["()"] = filter_class
+            prepared_filters[filter_name] = prepared_filter_config
+
+        return prepared_config
+
+    def configure(self, logging_config: dict[str, Any]) -> None:
+        """Configure project logging using ``logging_config`` (e.g. from project
+        logging.yml). We store this in the UserDict data so that it can be reconfigured
+        in _bootstrap_subprocess.
+        """
+        resolved_logging_classes: dict[str, type[Any] | None] = {}
+        validated_config = self._validate_logging_config(
+            logging_config, resolved_logging_classes
+        )
+        logging.config.dictConfig(
+            self._prepare_logging_config(validated_config, resolved_logging_classes)
+        )
+        self.data = validated_config
+
+    def set_project_logging(
+        self, package_name: str, preserve_logging: bool = False
+    ) -> None:
+        """Add the project level logging to the loggers upon provision of a package name.
+        Checks if project logger already exists to prevent overwriting, if none exists
+        it defaults to setting project logs at INFO level.
+
+        Args:
+            package_name: The name of the project package.
+            preserve_logging: If True, skip re-applying the logging configuration via
+                ``dictConfig``. This prevents runtime-added handlers from being wiped
+                when ``configure_project()`` is called after custom handlers have been
+                attached (e.g. in a long-running server process).
+        """
+        loggers = self.data.get("loggers", {})
+        if not loggers:
+            self.data["loggers"] = {}  # pragma: no cover
+
+        if package_name not in self.data["loggers"]:
+            self.data["loggers"][package_name] = {"level": "INFO"}
+            if not preserve_logging:
+                self.configure(self.data)
+
+
+PACKAGE_NAME = None
+LOGGING = _ProjectLogging()
+
+settings = _ProjectSettings()
+
+pipelines = _ProjectPipelines()
+
+
+def configure_project(package_name: str, preserve_logging: bool = False) -> None:
+    """Configure a Kedro project by populating its settings with values
+    defined in user's settings.py and pipeline_registry.py.
+
+    Args:
+        package_name: The name of the project package.
+        preserve_logging: If True, skip re-applying the logging configuration when
+            setting up the project logger. Useful in long-running processes (e.g.
+            FastAPI apps) where custom handlers are added at runtime and must not
+            be overwritten on repeated calls to ``configure_project()``.
+    """
+    settings_module = f"{package_name}.settings"
+    settings.configure(settings_module)
+
+    pipelines_module = f"{package_name}.pipeline_registry"
+    pipelines.configure(pipelines_module)
+
+    # Once the project is successfully configured once, store PACKAGE_NAME as a
+    # global variable to make it easily accessible. This is used by validate_settings()
+    # below, and also by ParallelRunner on Windows, as package_name is required every
+    # time a new subprocess is spawned.
+    global PACKAGE_NAME  # noqa: PLW0603
+    PACKAGE_NAME = package_name
+
+    if PACKAGE_NAME:
+        LOGGING.set_project_logging(PACKAGE_NAME, preserve_logging=preserve_logging)
+
+
+def configure_logging(logging_config: dict[str, Any]) -> None:
+    """Configure logging according to ``logging_config`` dictionary."""
+    LOGGING.configure(logging_config)
+
+
+def validate_settings() -> None:
+    """Eagerly validate that the settings module is importable if it exists. This is desirable to
+    surface any syntax or import errors early. In particular, without eagerly importing
+    the settings module, dynaconf would silence any import error (e.g. missing
+    dependency, missing/mislabelled pipeline), and users would instead get a cryptic
+    error message ``Expected an instance of `ConfigLoader`, got `NoneType` instead``.
+    More info on the dynaconf issue: https://github.com/dynaconf/dynaconf/issues/460
+    """
+    if PACKAGE_NAME is None:
+        raise ValueError(
+            "Package name not found. Make sure you have configured the project using "
+            "'bootstrap_project'. This should happen automatically if you are using "
+            "Kedro command line interface."
+        )
+    # Check if file exists, if it does, validate it.
+    if importlib.util.find_spec(f"{PACKAGE_NAME}.settings") is not None:
+        importlib.import_module(f"{PACKAGE_NAME}.settings")
+    else:
+        logger = logging.getLogger(__name__)
+        logger.warning("No 'settings.py' found, defaults will be used.")
+
+
+def _create_pipeline(pipeline_module: types.ModuleType) -> Pipeline | None:
+    if not hasattr(pipeline_module, "create_pipeline"):
+        warnings.warn(
+            f"The '{pipeline_module.__name__}' module does not "
+            f"expose a 'create_pipeline' function, so no pipelines "
+            f"defined therein will be returned by 'find_pipelines'."
+        )
+        return None
+
+    obj = getattr(pipeline_module, "create_pipeline")()
+    if not isinstance(obj, Pipeline):
+        warnings.warn(
+            f"Expected the 'create_pipeline' function in the "
+            f"'{pipeline_module.__name__}' module to return a "
+            f"'Pipeline' object, got '{type(obj).__name__}' "
+            f"instead. Nothing defined therein will be returned by "
+            f"'find_pipelines'."
+        )
+        return None
+
+    return obj
+
+
+def find_pipelines(  # noqa: PLR0912, PLR0915
+    raise_errors: bool = False, pipelines_to_find: list[str] | None = None
+) -> dict[str, Pipeline]:
+    """Automatically find modular pipelines having a ``create_pipeline``
+    function. By default, projects created using Kedro 0.18.3 and higher
+    call this function to autoregister pipelines upon creation/addition.
+
+    Projects that require more fine-grained control can still define the
+    pipeline registry without calling this function. Alternatively, they
+    can modify the mapping generated by the ``find_pipelines`` function.
+
+    For more information on the pipeline registry and autodiscovery, see
+    https://docs.kedro.org/en/stable/build/pipeline_registry/
+
+    Args:
+        raise_errors: If ``True``, raise an error upon failed discovery.
+        pipelines_to_find: Optional list of pipeline names to load selectively.
+            If ``None`` or contains ``"__default__"``, all pipelines are loaded.
+
+    Returns:
+        A generated mapping from pipeline names to ``Pipeline`` objects.
+
+    Raises:
+        RuntimeError: When the project has not been configured (i.e.
+            ``PACKAGE_NAME`` is ``None``).
+        ImportError: When a module does not expose a ``create_pipeline``
+            function, the ``create_pipeline`` function does not return a
+            ``Pipeline`` object, or if the module import fails up front.
+            If ``raise_errors`` is ``False``, see Warns section instead.
+
+    Warns:
+        UserWarning: When a module does not expose a ``create_pipeline``
+            function, the ``create_pipeline`` function does not return a
+            ``Pipeline`` object, or if the module import fails up front.
+            If ``raise_errors`` is ``True``, see Raises section instead.
+    """
+    if PACKAGE_NAME is None:
+        raise RuntimeError(
+            "'find_pipelines' cannot be called before the project is configured. "
+            "Call 'configure_project' first."
+        )
+
+    # CLI-set filter takes precedence; falls back to the explicit kwarg.
+    pipeline_filter = (
+        pipelines._requested_pipelines
+        if pipelines._requested_pipelines is not None
+        else pipelines_to_find
+    )
+    load_all = pipeline_filter is None or "__default__" in pipeline_filter
+    requested_pipelines: set[str] | None = None if load_all else set(pipeline_filter)  # type: ignore[arg-type]
+
+    pipelines_dict: dict[str, Pipeline] = {}
+
+    if load_all:
+        # Handle the simplified project structure found in several starters.
+        pipeline_obj = None
+        pipeline_module_name = f"{PACKAGE_NAME}.pipeline"
+        try:
+            pipeline_module = importlib.import_module(pipeline_module_name)
+        except Exception as exc:
+            if str(exc) != f"No module named '{pipeline_module_name}'":
+                if raise_errors:
+                    raise ImportError(
+                        f"An error occurred while importing the "
+                        f"'{pipeline_module_name}' module."
+                    ) from exc
+
+                warnings.warn(
+                    IMPORT_ERROR_MESSAGE.format(
+                        module=pipeline_module_name, tb_exc=traceback.format_exc()
+                    )
+                )
+        else:
+            pipeline_obj = _create_pipeline(pipeline_module)
+
+        pipelines_dict["__default__"] = pipeline_obj or pipeline([])
+
+    # Handle the case that a project doesn't have a pipelines directory.
+    try:
+        pipelines_package = importlib.resources.files(f"{PACKAGE_NAME}.pipelines")
+    except ModuleNotFoundError as exc:
+        if str(exc) == f"No module named '{PACKAGE_NAME}.pipelines'":
+            if requested_pipelines is not None:
+                missing_str = ", ".join(sorted(requested_pipelines))
+                error_msg = f"Pipeline(s) not found: {missing_str}"
+                if raise_errors:
+                    raise KeyError(error_msg) from exc
+                warnings.warn(error_msg)
+                return {}
+            return pipelines_dict
+
+    seen: set[str] = set()
+    for pipeline_dir in pipelines_package.iterdir():
+        if not pipeline_dir.is_dir():
+            continue
+
+        pipeline_name = pipeline_dir.name
+        if pipeline_name == "__pycache__":
+            continue
+        # Prevent imports of hidden directories/files
+        if pipeline_name.startswith("."):
+            continue
+
+        if requested_pipelines is not None and pipeline_name not in requested_pipelines:
+            continue
+
+        seen.add(pipeline_name)
+        pipeline_module_name = f"{PACKAGE_NAME}.pipelines.{pipeline_name}"
+        try:
+            pipeline_module = importlib.import_module(pipeline_module_name)
+        except Exception as exc:
+            if raise_errors:
+                raise ImportError(
+                    f"An error occurred while importing the "
+                    f"'{pipeline_module_name}' module."
+                ) from exc
+
+            warnings.warn(
+                IMPORT_ERROR_MESSAGE.format(
+                    module=pipeline_module_name, tb_exc=traceback.format_exc()
+                )
+            )
+            continue
+
+        pipeline_obj = _create_pipeline(pipeline_module)
+        if pipeline_obj is not None:
+            pipelines_dict[pipeline_name] = pipeline_obj
+        elif raise_errors:
+            raise KeyError(f"Pipeline '{pipeline_name}' not found")
+
+    if requested_pipelines is not None:
+        for pipeline_name in requested_pipelines - seen:
+            pipeline_module_name = f"{PACKAGE_NAME}.pipelines.{pipeline_name}"
+            error_msg = f"An error occurred while importing the '{pipeline_module_name}' module."
+            if raise_errors:
+                raise ImportError(error_msg)
+            warnings.warn(
+                f"{error_msg} Nothing defined therein will be returned by 'find_pipelines'."
+            )
+
+    return pipelines_dict
